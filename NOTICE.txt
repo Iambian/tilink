@@ -1,0 +1,2 @@
+This project has been discontinued in the form of the Python script.
+Turns out it needed to have been done in C.
