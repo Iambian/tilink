@@ -1,4 +1,4 @@
-
+import random
 import uctypes,rp2,time,machine
 from machine import Pin
 from rp2 import PIO
@@ -39,6 +39,7 @@ PIO0_BASE = 0x50200000
 PIO_IRQ = 0x0030
 PIO_IRQ_FORCE = 0x0034
 SM0_EXECCTRL = 0x00CC
+SM0_SHIFTCTRL = 0x00D0
 SM0_PINCTRL = 0x00DC
 SM0_ADDR = 0x00D4
 SM0_INSTR = 0x00D8
@@ -70,7 +71,7 @@ class TILINK(object):
         'sideset_base' : pin0,
         'set_base' : pin0,
         'in_shiftdir' : PIO.SHIFT_RIGHT,
-        'out_shiftdir' : PIO.SHIFT_LEFT,
+        'out_shiftdir' : PIO.SHIFT_RIGHT,
         'push_thresh' : 8,
         'pull_thresh' : 8
     }
@@ -83,52 +84,51 @@ class TILINK(object):
         #------------------------------
 
         label("rcv")
-        mov(osr,pins)   #0B get pins into OSR, to allow testing one at a time
+        jmp("rcv")
+        ''' TODO: CHANGE OSR BECAUSE SHIFTING IN OTHER DIRECTION
+        mov(osr,pins)   #get pins into OSR, to allow testing one at a time
         out(null,30)    #discard upper 30 bits
         out(x,1)        #Test white pin
         jmp(not_x,"get1")   #White low. See if we can receive a '1'
         out(x,1)        #Test red pin
-        jmp(not_x,"get0")   #Red low. We are receving a '0'
-        jmp("rcv")
+        jmp(x_dec,"rcv")    #Keep looping if red also not low.
+
+        label("get0")   #Red low. See if we can receive a '0'
+        wait(1,pin,0)   .side(2)   #assert white low, wait for red high
+        set(x,0)        .side(0)   #deassert white, red is high
+        wait(1,pin,1)   .side(0)   #wait for white to go back high
+        jmp("rcvcont")
 
         label("get1")
-        out(x,1)        #12
+        out(x,1)
         jmp(not_x,"error")
         wait(1,pin,1)   .side(1)   #assert red low, wait for white high
         set(x,1)        .side(0)   #deassert red, white is high
         wait(1,pin,0)   .side(0)   #wait for red to go back high
-        jmp("rcvcont")
 
-        label("get0")   #18
-        wait(1,pin,0)   .side(2)   #assert white low, wait for red high
-        set(x,0)        .side(0)   #deassert white, red is high
-        wait(1,pin,1)   .side(0)   #wait for white to go back high
-
-        label("rcvcont")    #1B
+        label("rcvcont")    #
         in_(x,1)                  #shift bit into ISR
         jmp(y_dec,"rcv")          #when out of bits, go back to start and wait
         jmp("start")              #else go back to receive loop
-        #------------------------------
         '''
+        #------------------------------
+        label("send0")
+        wait(0,pin,1)   .side(1)    #Assert red low, wait for white to go low too
+        wait(1,pin,1)   .side(0)    #Deassert red, wait for white to go back high
+
+        label("xmitcont")
+        jmp(y_dec,"xmit")          #when sent all bits, go back to start and wait
+        jmp("start")
+
+        label("xmit")       #1E
+        out(x,1)        .side(0)    #get bit from OSR
+        jmp(not_x,"send0")
+
         label("send1")
         wait(0,pin,0)   .side(2)    #Assert white low, wait for red to go low too
         wait(1,pin,0)   .side(0)    #Deassert white, wait for red to go back high
-
-        label("xmitcont")
-        jmp(y_dec,"start")          #when sent all bits, go back to start and wait
-        '''
-
-        label("xmit")       #1E
-        jmp("xmit")
-        '''
-        out(x,1)                    #get bit from OSR
-        jmp(x_dec,"send1")
-        label("send0")
-
-        wait(0,pin,1)   .side(1)    #Assert red low, wait for white to go low too
-        wait(1,pin,1)   .side(0)    #Deassert red, wait for white to go back high
         jmp("xmitcont")
-        '''
+
 
         label("error")      #1F
         jmp("error")
@@ -160,6 +160,7 @@ class TILINK(object):
             if time.ticks_diff(time.ticks_ms(),curtime) > 2000:
                 return -1
         cls.tilink_sm.put(databyte)
+        machine.mem32[PIO0_BASE+SM0_SHIFTCTRL+ATOMIC_OR] = 1 << 17  #autopull on
         cls.run_now()
         return 0
 
@@ -171,19 +172,29 @@ class TILINK(object):
             if time.ticks_diff(time.ticks_ms(),curtime) > 2000:
                 return -1
             print(decode_pio(machine.mem32[PIO0_BASE+SM0_INSTR]))
+        machine.mem32[PIO0_BASE+SM0_SHIFTCTRL+ATOMIC_AND] = ~(1<<17)  #autopull off
         cls.run_now()   #Start the machine in receive mode
         return cls.tilink_sm.get()
 
+    #Resets the state machine
+    @classmethod
+    def reset(cls):
+        cls.tilink_sm.restart()
+        cls.tilink_sm.active(True)
+        return
+
         
 
-#Current test: Recieve data
+#Current test: Transmit data
 def test():
     t = TILINK
-    value = t.get()
+    v = random.randint(0,255)
+    print("Sending data byte "+hex(v))
+    value = t.put(v<<24)
     if (value == -1):
         print("Error: Link Timeout")
     else:
-        print("Byte received: "+hex(value))
+        print("Byte sent.")
 def debug():
     print("Start instruction: "+decode_pio(TILINK.tilink_start_instr,2,True))
     print(decode_pio(machine.mem32[PIO0_BASE+SM0_INSTR],2,True))
