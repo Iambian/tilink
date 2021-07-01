@@ -7,7 +7,8 @@
 
 .define RED 0
 .define WHI 1
-
+.define HI 1
+.define LO 0
 
 
 
