@@ -1,5 +1,7 @@
-import random
-import uctypes,rp2,time,machine
+import micropython
+micropython.alloc_emergency_exception_buf(100)
+from micropython import const
+import uctypes,rp2,time,machine,random,array
 from machine import Pin
 from rp2 import PIO
 
@@ -35,37 +37,39 @@ def decode_pio(uint16_val, sideset_bits = 0, sideset_opt = False):
     if de:  s+=" ["+str(de)+"]"
     return s
 
-PIO0_BASE = 0x50200000
-PIO_IRQ = 0x0030
-PIO_IRQ_FORCE = 0x0034
-SM0_EXECCTRL = 0x00CC
-SM0_SHIFTCTRL = 0x00D0
-SM0_PINCTRL = 0x00DC
-SM0_ADDR = 0x00D4
-SM0_INSTR = 0x00D8
-PIO_IRQ0_INTE = 0x012C
+PIO0_BASE       = const(0x50200000)
+PIO_FSTAT       = const(0x0004)
+PIO_FLEVEL      = const(0x000C)
+PIO_TXF0        = const(0x0010)
+PIO_RXF0        = const(0x0020)
+PIO_IRQ         = const(0x0030)
+PIO_IRQ_FORCE   = const(0x0034)
+SM0_EXECCTRL    = const(0x00CC)
+SM0_SHIFTCTRL   = const(0x00D0)
+SM0_PINCTRL     = const(0x00DC)
+SM0_ADDR        = const(0x00D4)
+SM0_INSTR       = const(0x00D8)
+PIO_IRQ0_INTE   = const(0x012C)
 
-ATOMIC_NORMAL = 0x0000
-ATOMIC_XOR = 0x1000
-ATOMIC_OR = 0x02000
-ATOMIC_AND = 0x3000
+ATOMIC_NORMAL   = const(0x0000)
+ATOMIC_XOR      = const(0x1000)
+ATOMIC_OR       = const(0x02000)
+ATOMIC_AND      = const(0x3000)
 
 class TILINK(object):
-    print("Loading class...")
-    #Reimport due to some sort of uploading silliness
-    pin0 = Pin(0)
-
-    INIT_ASM_STATE = {
+    print("Initializing TILINK class")
+    pin0 = Pin(0)           #BASE PIN THAT OUR STATE MACHINE WILL USE
+    pin1 = Pin(1)           #BASE PIN + 1 THAT IS USED FOR JMP_PIN
+    PIO_INIT = {
         'out_init' : (PIO.OUT_LOW,PIO.OUT_LOW),
         'set_init' : (PIO.OUT_LOW,PIO.OUT_LOW),
         'sideset_init' : (PIO.OUT_LOW,PIO.OUT_LOW),
-        'autopull' : False,
+        'autopull' : True,
         'pull_thresh' : 8,
         'autopush' : True,
         'push_thresh' : 8
     }
-
-    INIT_SM_STATE = {
+    SM_INIT = {
         'freq' : 100000,
         'in_base' : pin0,
         'sideset_base' : pin0,
@@ -73,147 +77,168 @@ class TILINK(object):
         'in_shiftdir' : PIO.SHIFT_RIGHT,
         'out_shiftdir' : PIO.SHIFT_RIGHT,
         'push_thresh' : 8,
-        'pull_thresh' : 8
+        'pull_thresh' : 8,
+        'jmp_pin' : pin1
     }
-    @rp2.asm_pio(**INIT_ASM_STATE)
-    def tilink_pio():
-        label("start")
-        jmp("start").side(0)    #08 waitloop. Also ensure pins are high
-        set(y,7)
-        jmp(not_osre,"xmit")
-        #------------------------------
+    @rp2.asm_pio(**PIO_INIT)
+    def pio():
+        wrap_target()
+        label("0")
+        jmp("0")                .side(0)      # 0
+        label("1")
+        irq(block,0)            .side(0)      # 1
+        label("restartloop")
+        set(y, 7)                             # 2
+        label("3")
+        jmp(not_osre, "19")                   # 3
+        label("4")
+        mov(osr, pins)                        # 4
+        out(x, 1)                             # 5
+        out(null, 31)                         # 6
+        jmp(not_x, "12")                      # 7
+        jmp(pin, "3")                         # 8
+        wait(1, pin, 1)         .side(1)      # 9
+        wait(1, pin, 0)         .side(0)      # 10
+        jmp("16")                             # 11
+        label("12")
+        jmp(pin, "14")                        # 12
+        jmp("error")                          # 13
+        label("14")
+        wait(1, pin, 0)         .side(2)      # 14
+        wait(1, pin, 1)         .side(0)      # 15
+        label("16")
+        in_(x, 1)                             # 16
+        jmp(y_dec, "4")                       # 17
+        jmp("1")                              # 18 interrupt on recieve
+        label("19")
+        set(y, 7)                             # 19 should deprecate this instr
+        label("20")
+        out(x, 1)                             # 20
+        jmp(not_x, "25")                      # 21
+        wait(0, pin, 0)         .side(2)      # 22
+        wait(1, pin, 0)         .side(0)      # 23
+        jmp("27")                             # 24
+        label("25")
+        wait(0, pin, 1)         .side(1)      # 25
+        wait(1, pin, 1)         .side(0)      # 26
+        label("27")
+        jmp(y_dec, "20")                      # 27
+        jmp("restartloop")                    # 28
+        label("error")
+        jmp("error")                          # 29
+        wrap()
+    
 
-        label("rcv")
-        jmp("rcv")
-        ''' TODO: CHANGE OSR BECAUSE SHIFTING IN OTHER DIRECTION
-        mov(osr,pins)   #get pins into OSR, to allow testing one at a time
-        out(null,30)    #discard upper 30 bits
-        out(x,1)        #Test white pin
-        jmp(not_x,"get1")   #White low. See if we can receive a '1'
-        out(x,1)        #Test red pin
-        jmp(x_dec,"rcv")    #Keep looping if red also not low.
-
-        label("get0")   #Red low. See if we can receive a '0'
-        wait(1,pin,0)   .side(2)   #assert white low, wait for red high
-        set(x,0)        .side(0)   #deassert white, red is high
-        wait(1,pin,1)   .side(0)   #wait for white to go back high
-        jmp("rcvcont")
-
-        label("get1")
-        out(x,1)
-        jmp(not_x,"error")
-        wait(1,pin,1)   .side(1)   #assert red low, wait for white high
-        set(x,1)        .side(0)   #deassert red, white is high
-        wait(1,pin,0)   .side(0)   #wait for red to go back high
-
-        label("rcvcont")    #
-        in_(x,1)                  #shift bit into ISR
-        jmp(y_dec,"rcv")          #when out of bits, go back to start and wait
-        jmp("start")              #else go back to receive loop
-        '''
-        #------------------------------
-        label("send0")
-        wait(0,pin,1)   .side(1)    #Assert red low, wait for white to go low too
-        wait(1,pin,1)   .side(0)    #Deassert red, wait for white to go back high
-
-        label("xmitcont")
-        jmp(y_dec,"xmit")          #when sent all bits, go back to start and wait
-        jmp("start")
-
-        label("xmit")       #1E
-        out(x,1)        .side(0)    #get bit from OSR
-        jmp(not_x,"send0")
-
-        label("send1")
-        wait(0,pin,0)   .side(2)    #Assert white low, wait for red to go low too
-        wait(1,pin,0)   .side(0)    #Deassert white, wait for red to go back high
-        jmp("xmitcont")
-
-
-        label("error")      #1F
-        jmp("error")
-
-    print(str(tilink_pio))
-    tilink_pio[3] |= 1 << 29
-    tilink_sm = rp2.StateMachine(0,tilink_pio,**INIT_SM_STATE)
-    tilink_sm.restart()
-    tilink_sm.active(True)
+    pio[3] |= 1 << 29    #Sets sideset mode to pindirs
+    sm = rp2.StateMachine(0,pio,**SM_INIT)
+    sm.restart()
+    sm.active(True)
     time.sleep_ms(100)
-    tilink_start_instr = machine.mem32[PIO0_BASE+SM0_INSTR] #Should be jmp [...]
-    tilink_exec_begin = tilink_start_instr+1    #Increment address field
+    smstop = machine.mem32[PIO0_BASE+SM0_INSTR]
+    smgo   = smstop + 2     #Jump over the irq instruction
+    machine.mem32[PIO0_BASE+SM0_INSTR] = smgo
+    rxbuf = bytearray(256)
+    rxbuftail = 0
+    rxbufhead = 0
+    rxsize = 0
+    
+    @classmethod
+    def execonce(cls,instr):
+        machine.mem32[PIO0_BASE+SM0_INSTR] = instr
+        while machine.mem32[PIO0_BASE+SM0_INSTR] == instr:
+            pass
 
-    #Returns False if idle, True if still executing
-    @staticmethod
-    def is_running():
-        return machine.mem32[PIO0_BASE+SM0_INSTR] != TILINK.tilink_start_instr
-
-    @staticmethod
-    def run_now():
-        machine.mem32[PIO0_BASE+SM0_INSTR] = TILINK.tilink_exec_begin
+    @classmethod
+    def isr(cls,pio):   #triggers on byte sent or on byte received
+        irq_state = machine.disable_irq()
+        #Critical section begin
+        print("Trig at size: "+str(TILINK.rxsize))
+        fstat = machine.mem32[PIO0_BASE+PIO_FSTAT]
+        if not fstat & const(1<<8):     #Check if rxf0empty. Get byte if not.
+            if TILINK.rxsize < 127:
+                TILINK.rxsize += 1
+                TILINK.rxbuf[TILINK.rxbuftail] = machine.mem32[PIO0_BASE+PIO_RXF0] >> 24
+                TILINK.rxbuftail = TILINK.rxbuftail+1 & 127
+        else:
+            print("Data dropped with fstat condition code"+hex(fstat))
+        machine.enable_irq(irq_state)
         return
 
-    #Returns 0 on success, -1 on timeout
+    rp2.PIO(0).irq(lambda pio: TILINK.isr(pio))
+
     @classmethod
-    def put(cls,databyte):
+    def sendchunk(cls,chunk):
+        machine.mem32[PIO0_BASE+SM0_INSTR] = cls.smstop
+        cls.execonce(0x9080) #pull any remaining junk off the TX FIFO
+        cls.execonce(0x6060) #out null,32. discards contents of OSR
+        for i in chunk:
+            cls.sm.put(i)
         curtime = time.ticks_ms()
-        while cls.is_running():
+        machine.mem32[PIO0_BASE+SM0_INSTR] = cls.smgo
+        #Wait up to 2 seconds for the tx fifo to empty out and return to recv state
+        #need both conditions to ensure consistent start and stop
+        while (not machine.mem32[PIO0_BASE+PIO_FSTAT] & (1<<24)) or machine.mem32[PIO0_BASE+SM0_ADDR] < (cls.smgo & 31) + 19:
             if time.ticks_diff(time.ticks_ms(),curtime) > 2000:
+                print(machine.mem32[PIO0_BASE+PIO_FSTAT] & (1<<24))
+                print(machine.mem32[PIO0_BASE+SM0_ADDR])
+                print(cls.smgo + 19)
                 return -1
-        cls.tilink_sm.put(databyte)
-        machine.mem32[PIO0_BASE+SM0_SHIFTCTRL+ATOMIC_OR] = 1 << 17  #autopull on
-        cls.run_now()
+        return 0
+        
+    @classmethod
+    def send(cls,data):
+        #Halt the state machine
+        #Check if input data is a sequenceable object. Else assume it's a byte
+        try:    data[0]
+        except:
+            darr = bytearray(1)
+            darr[0] = data
+            data = darr
+        for i in range(0,len(data),4):
+            print(data[i:i+4])
+            if cls.sendchunk(data[i:i+4]) < 0:
+                return -1
         return 0
 
-    #Returns [0x00-0xFF] on success, -1 on timeout
     @classmethod
     def get(cls):
+        #Wait for data to come into the rxbuf
+        data = -1
         curtime = time.ticks_ms()
-        while cls.is_running():
+        while not cls.rxsize:
             if time.ticks_diff(time.ticks_ms(),curtime) > 2000:
                 return -1
-            print(decode_pio(machine.mem32[PIO0_BASE+SM0_INSTR]))
-        machine.mem32[PIO0_BASE+SM0_SHIFTCTRL+ATOMIC_AND] = ~(1<<17)  #autopull off
-        cls.run_now()   #Start the machine in receive mode
-        return cls.tilink_sm.get()
+        irq_state = machine.disable_irq()
+        #Critical section begins
+        cls.rxsize -= 1
+        data = cls.rxbuf[cls.rxbufhead]
+        cls.rxbufhead += 1
+        #Critical section ends
+        machine.enable_irq(irq_state)
+        return data
+    print("TILINK class initialized")
+    
+t = TILINK
+def get():
+    databuf = []
+    data = 0
+    while True:
+        data = TILINK.get()
+        if data < 0:
+            return databuf
+        else:
+            databuf.append(hex(data))
+def reset():
+    TILINK.sm.restart()
+    TILINK.sm.active(1)
+    machine.mem32[PIO0_BASE+SM0_INSTR] = TILINK.smgo
 
-    #Resets the state machine
-    @classmethod
-    def reset(cls):
-        cls.tilink_sm.restart()
-        cls.tilink_sm.active(True)
-        return
-
-        
-
-#Current test: Transmit data
-def test():
-    t = TILINK
-    v = random.randint(0,255)
-    print("Sending data byte "+hex(v))
-    value = t.put(v<<24)
-    if (value == -1):
-        print("Error: Link Timeout")
-    else:
-        print("Byte sent.")
 def debug():
-    print("Start instruction: "+decode_pio(TILINK.tilink_start_instr,2,True))
+    print("Start instruction: "+decode_pio(TILINK.smstop,2,True))
     print(decode_pio(machine.mem32[PIO0_BASE+SM0_INSTR],2,True))
     print("Is stalled? "+str(True if machine.mem32[PIO0_BASE+SM0_INSTR]>>31&1 else False))
-def reset():
-    TILINK.tilink_sm.restart()
-    TILINK.tilink_sm.active(True)
-    machine.mem32[PIO0_BASE+SM0_INSTR] = TILINK.tilink_start_instr
-def run(instr):
-    i = rp2.asm_pio_encode(instr,2)
-    machine.mem32[PIO0_BASE+SM0_INSTR] = i
-def get():
-    print(str(TILINK.get()))
-def testloop():
+def dbg():
     while True:
-        test()
-
-
-
-
+        print("Curinst: "+decode_pio(machine.mem32[PIO0_BASE+SM0_INSTR],2,True)+"       ",end='\r')
 
 
