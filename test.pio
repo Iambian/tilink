@@ -45,12 +45,12 @@ xmitloop:
     jmp !x, send0
 send1:
     wait 0 pin 0 side 2
-    wait 1 pin 0 side 0
     jmp xmitend
 send0:
     wait 0 pin 1 side 1
-    wait 1 pin 1 side 0
 xmitend:
+    wait 1 pin 0 side 0
+    wait 1 pin 1 side 0
     jmp y--, xmitloop
     jmp startwait
 

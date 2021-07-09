@@ -1,9 +1,19 @@
 import micropython
 micropython.alloc_emergency_exception_buf(100)
 from micropython import const
-import uctypes,rp2,time,machine,random,array
+import uctypes,rp2,time,machine,random,array,collections
 from machine import Pin
 from rp2 import PIO
+import builtins
+def hex(value):
+    if type(value) is int:
+        return builtins.hex(value)
+    if type(value) is str and len(value)>0:
+        return str([builtins.hex(ord(i)) for i in value])
+    if iter(value) and len(value) > 0:
+        return str([builtins.hex(i) for i in value])
+    return str([])
+
 
 def decode_pio(uint16_val, sideset_bits = 0, sideset_opt = False):
     def di(fbv):    return str(fbv&7)+(" REL" if fbv&16 else "")
@@ -70,7 +80,7 @@ class TILINK(object):
         'push_thresh' : 8
     }
     SM_INIT = {
-        'freq' : 100000,
+        'freq' : 50000,
         'in_base' : pin0,
         'sideset_base' : pin0,
         'set_base' : pin0,
@@ -90,7 +100,7 @@ class TILINK(object):
         label("restartloop")
         set(y, 7)                             # 2
         label("3")
-        jmp(not_osre, "19")                   # 3
+        jmp(not_osre, "xmit")                 # 3
         label("4")
         mov(osr, pins)                        # 4
         out(x, 1)                             # 5
@@ -110,20 +120,21 @@ class TILINK(object):
         in_(x, 1)                             # 16
         jmp(y_dec, "4")                       # 17
         jmp("1")                              # 18 interrupt on recieve
-        label("19")
+        label("xmit")
         set(y, 7)                             # 19 should deprecate this instr
-        label("20")
-        out(x, 1)                             # 20
-        jmp(not_x, "25")                      # 21
+        label("xmitloop")
+        out(x, 1)               .side(0)      # 20
+        jmp(not_x, "send0")                   # 21
+        label("send1")     
         wait(0, pin, 0)         .side(2)      # 22
-        wait(1, pin, 0)         .side(0)      # 23
-        jmp("27")                             # 24
-        label("25")
+        jmp("endxmit")                        # 24
+        label("send0")
         wait(0, pin, 1)         .side(1)      # 25
-        wait(1, pin, 1)         .side(0)      # 26
-        label("27")
-        jmp(y_dec, "20")                      # 27
-        jmp("restartloop")                    # 28
+        label("endxmit")
+        wait(1, pin, 0)         .side(0) [3]  # 23
+        wait(1, pin, 1)         .side(0) [3]  # 26
+        jmp(y_dec, "xmitloop")           [3]  # 27
+        jmp("restartloop")               [3]  # 28
         label("error")
         jmp("error")                          # 29
         wrap()
@@ -147,12 +158,13 @@ class TILINK(object):
         machine.mem32[PIO0_BASE+SM0_INSTR] = instr
         while machine.mem32[PIO0_BASE+SM0_INSTR] == instr:
             pass
+    
 
     @classmethod
     def isr(cls,pio):   #triggers on byte sent or on byte received
         irq_state = machine.disable_irq()
         #Critical section begin
-        print("Trig at size: "+str(TILINK.rxsize))
+        #print("Trig at size: "+str(TILINK.rxsize))
         fstat = machine.mem32[PIO0_BASE+PIO_FSTAT]
         if not fstat & const(1<<8):     #Check if rxf0empty. Get byte if not.
             if TILINK.rxsize < 127:
@@ -169,22 +181,38 @@ class TILINK(object):
     @classmethod
     def sendchunk(cls,chunk):
         machine.mem32[PIO0_BASE+SM0_INSTR] = cls.smstop
-        cls.execonce(0x9080) #pull any remaining junk off the TX FIFO
-        cls.execonce(0x6060) #out null,32. discards contents of OSR
+        time.sleep_ms(1)
+        machine.mem32[PIO0_BASE+SM0_INSTR] = 0xA0E3 #Fills OSR with all 0. Is full.
+        time.sleep_ms(1)
+        machine.mem32[PIO0_BASE+SM0_INSTR] = 0x7068 #Empties OSR, will stall.
+        time.sleep_ms(1)
         for i in chunk:
+            #print("Send byte "+hex(i))
             cls.sm.put(i)
+        cls.execonce(0xA042) #nop. Allows time for autopull to fill OSR
+        #print("instr: "+decode_pio(machine.mem32[PIO0_BASE+SM0_INSTR],2,True))
         curtime = time.ticks_ms()
         machine.mem32[PIO0_BASE+SM0_INSTR] = cls.smgo
         #Wait up to 2 seconds for the tx fifo to empty out and return to recv state
         #need both conditions to ensure consistent start and stop
-        while (not machine.mem32[PIO0_BASE+PIO_FSTAT] & (1<<24)) or machine.mem32[PIO0_BASE+SM0_ADDR] < (cls.smgo & 31) + 19:
+        #cond1: if TXEMPTY bit is clear (not empty) or curaddress still in xmit section of code
+        while (not machine.mem32[PIO0_BASE+PIO_FSTAT] & (1<<24)) or machine.mem32[PIO0_BASE+SM0_ADDR] >= (cls.smgo & 31) + 19:
             if time.ticks_diff(time.ticks_ms(),curtime) > 2000:
-                print(machine.mem32[PIO0_BASE+PIO_FSTAT] & (1<<24))
-                print(machine.mem32[PIO0_BASE+SM0_ADDR])
-                print(cls.smgo + 19)
+                print("Fstat state: "+str(machine.mem32[PIO0_BASE+PIO_FSTAT] & (1<<24)))
+                curinst = machine.mem32[PIO0_BASE+SM0_INSTR]
+                curaddr = machine.mem32[PIO0_BASE+SM0_ADDR]
+                print("Current address: "+str(curaddr))
+                print("Address threshhold: "+str((cls.smgo & 31) + 19))
+                print("Instruction at address: "+decode_pio(curinst,2,True))
                 return -1
         return 0
         
+    @classmethod
+    def reset(cls):
+        cls.sm.restart()
+        cls.sm.active(1)
+        machine.mem32[PIO0_BASE+SM0_INSTR] = cls.smgo
+
     @classmethod
     def send(cls,data):
         #Halt the state machine
@@ -195,18 +223,23 @@ class TILINK(object):
             darr[0] = data
             data = darr
         for i in range(0,len(data),4):
-            print(data[i:i+4])
+            print("Sent: "+hex(data[i:i+4]))
             if cls.sendchunk(data[i:i+4]) < 0:
                 return -1
         return 0
 
     @classmethod
-    def get(cls):
+    def get(cls,waittime_ms=2000):
         #Wait for data to come into the rxbuf
         data = -1
         curtime = time.ticks_ms()
         while not cls.rxsize:
-            if time.ticks_diff(time.ticks_ms(),curtime) > 2000:
+            if time.ticks_diff(time.ticks_ms(),curtime) > waittime_ms:
+                if machine.mem32[PIO0_BASE+SM0_ADDR] == 0x19:
+                    print("Xmit error: Link entered error state. Resetting.")
+                    cls.sm.restart()
+                    cls.sm.active(1)
+                    machine.mem32[PIO0_BASE+SM0_ADDR] = cls.smgo
                 return -1
         irq_state = machine.disable_irq()
         #Critical section begins
@@ -216,6 +249,117 @@ class TILINK(object):
         #Critical section ends
         machine.enable_irq(irq_state)
         return data
+
+    @classmethod
+    def getbytes(cls,numbytes,waittime_ms=2000):
+        arr = bytearray(numbytes)
+        for matey in range(numbytes):
+            pirate = cls.get(waittime_ms)
+            if pirate < 0:
+                if not arr:
+                    return -1
+                else:
+                    return arr[0:matey]
+            arr[matey] = pirate
+        return arr
+        
+    packetsize = 0
+    packetdata = bytearray(65536)
+
+    #Note: prevcommand and prevdata is set if you send an initial request
+    #and use this function to complete the transaction. Action indicates what
+    #you want to do with the transaction if the other two arguments do not
+    #supply enough information to make it obvious of what to do
+    @classmethod
+    def protocol_get(cls,prevcommand = 0, prevdata=[],action = 0):
+        state = 0       #Recieve state. Receiving packet and/or data
+        packet = bytearray(4)
+        arr = bytearray()
+        arr2 = bytearray()
+        machineid = 0
+        commandid = 0
+        delay = 999999  #Wait a really long time for that first packet
+        while True:
+            if 0==state:    #Receiving packet.
+                arr = cls.getbytes(4,delay)
+                delay = 2000    #Go back to waiting 2 secs between each packet.
+                if len(arr)<4:
+                    raise Exception("Truncated base packet. Received "+hex(arr))
+                machineid = arr[0]
+                commandid = arr[1]
+                datalen = arr[2] + arr[3]*256
+                if datalen and commandid in (0x06,0x15,0x36,0x88,0xA2,0xC9):
+                    arr2 = cls.getbytes(datalen)
+                    if arr2 == -1:
+                        raise Exception("Truncated data section. Expected "+hex(datalen)+" bytes, received "+str(arr2))
+                    arr3 = cls.getbytes(2)
+                    if arr2 == -1 or len(arr2) < 2:
+                        raise Exception("Checksum bytes not sent. Recieved: "+str(arr3))
+                    checksum = arr3[0] + arr3[1]*256
+                    if sum(arr2) != checksum:
+                        print("Expected checksum "+str(sum(arr2)+", got "+str(checksum)))
+                        raise Exception("Recieved data does not match checksum.")
+                else:
+                    arr2 = bytearray()
+                state = 1
+                print("Recieved base packet: "+hex(arr))
+                if arr2:
+                    print("Also recieved data: "+hex(arr2))
+            if 1==state:    #Process recieved packet
+                if machineid not in (0x02,0x03,0x23,0x73,0x82,0x83):
+                    raise Exception("Invalid machine ID. Received: "+str(machineid))
+                if 0x09 == commandid:
+                    print("CTS received")
+                    state=0
+                elif 0x06 == commandid:
+                    print("Variable header received: "+str(arr2))
+                    prevdata = arr2[:]
+                    prevcommand = commandid
+                    cls.send([0x73,0x56,0x00,0x00]) #ACK
+                    cls.send([0x73,0x09,0x00,0x00]) #CTS
+                    state=0
+                elif 0x15 == commandid:
+                    print("DATA packet recieved: "+str(arr2))
+                    state=0
+                elif 0x36 == commandid:
+                    print("Skip/Exit packet received: "+str(arr2))
+                    print("Note: Rejection codes: 0x1=EXIT, 0x2=SKIP, 0x3=NOMEM")
+                    state=0
+                elif 0x56 == commandid:
+                    print("ACK packet received.")
+                    state=0
+                elif 0x5A == commandid:
+                    print("Checksum error packet received.")
+                    state=0
+                elif 0x68 == commandid:
+                    print("RDY packet received.")
+                    cls.send([0x73,0x56,0x00,0x00])
+                    state=0
+                elif 0x6D == commandid:
+                    print("Silent screeshot request packet received.")
+                    state=0
+                elif 0x88 == commandid:
+                    print("Silent delete variable request packet received.")
+                    print("Name of variable to delete: "+str(arr2))
+                    state=0
+                elif 0x92 == commandid:
+                    print("End of transmission packet recieved.")
+                    return 0
+                elif 0xA2 == commandid:
+                    print("Silent request variable request received.")
+                    print("Name of variable being requested: "+str(arr2))
+                    state=0
+                elif 0xC9 == commandid:
+                    print("Silent request to send variable request received")
+                    print("Name of variable being sent: "+str(arr2))
+                    state=0
+                else:
+                    print("Unrecognized command byte recieved: "+str(commandid))
+                    state=0
+            pass    #End of 1==state statement
+        pass        #End of endless while loop
+        return -1
+
     print("TILINK class initialized")
     
 t = TILINK
@@ -240,5 +384,6 @@ def debug():
 def dbg():
     while True:
         print("Curinst: "+decode_pio(machine.mem32[PIO0_BASE+SM0_INSTR],2,True)+"       ",end='\r')
-
+def getproto():
+    TILINK.protocol_get()
 
