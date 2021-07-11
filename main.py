@@ -1,10 +1,12 @@
 import micropython
-micropython.alloc_emergency_exception_buf(100)
+micropython.alloc_emergency_exception_buf(200)
 from micropython import const
 import uctypes,rp2,time,machine,random,array,collections
 from machine import Pin
 from rp2 import PIO
 import builtins
+import gc
+
 def hex(value):
     if type(value) is int:
         return builtins.hex(value)
@@ -66,6 +68,38 @@ ATOMIC_XOR      = const(0x1000)
 ATOMIC_OR       = const(0x02000)
 ATOMIC_AND      = const(0x3000)
 
+class PV(object):
+    VAR = 0x06
+    CTS = 0x09
+    DATA = 0x15
+    VER = 0x2D
+    SKIP = 0x36
+    ACK = 0x56
+    ERR = 0x5A
+    RDY = 0x68
+    DEL = 0x88
+    EOT = 0x92
+    REQ = 0xA2
+    RTS = 0xC9
+class PACKET(object):
+    def __init__(self,macid,cmdid,data=bytearray()):
+        self.mid = macid
+        self.cid = cmdid
+        self.data = data
+        if data:
+            self.size = len(data)
+            self.chksum = sum(data)
+        else:
+            self.size = 0
+            self.chksum = 0
+
+    def tobytes(self):
+        a1 = bytearray([self.mid,self.cid,self.size & 255,(self.size>>8)*256])
+        if self.data:
+            return a1+bytearray(data)+bytearray([self.chksum&255,(self.chksum>>8)*256])
+        else:
+            return a1
+
 class TILINK(object):
     print("Initializing TILINK class")
     pin0 = Pin(0)           #BASE PIN THAT OUR STATE MACHINE WILL USE
@@ -80,7 +114,7 @@ class TILINK(object):
         'push_thresh' : 8
     }
     SM_INIT = {
-        'freq' : 50000,
+        'freq' : 500000,
         'in_base' : pin0,
         'sideset_base' : pin0,
         'set_base' : pin0,
@@ -152,6 +186,8 @@ class TILINK(object):
     rxbuftail = 0
     rxbufhead = 0
     rxsize = 0
+    bytesgotten = 0
+    bytessent = 0
     
     @classmethod
     def execonce(cls,instr):
@@ -166,13 +202,13 @@ class TILINK(object):
         #Critical section begin
         #print("Trig at size: "+str(TILINK.rxsize))
         fstat = machine.mem32[PIO0_BASE+PIO_FSTAT]
-        if not fstat & const(1<<8):     #Check if rxf0empty. Get byte if not.
-            if TILINK.rxsize < 127:
-                TILINK.rxsize += 1
-                TILINK.rxbuf[TILINK.rxbuftail] = machine.mem32[PIO0_BASE+PIO_RXF0] >> 24
-                TILINK.rxbuftail = TILINK.rxbuftail+1 & 127
+        if (not fstat & const(1<<8)) and TILINK.rxsize < 127:     #Check if rxf0empty. Get byte if not.
+            TILINK.rxsize += 1
+            TILINK.rxbuf[TILINK.rxbuftail] = machine.mem32[PIO0_BASE+PIO_RXF0] >> 24
+            TILINK.rxbuftail = TILINK.rxbuftail+1 & 127
         else:
-            print("Data dropped with fstat condition code"+hex(fstat))
+            #print("Data dropped with fstat condition code"+hex(fstat))
+            pass
         machine.enable_irq(irq_state)
         return
 
@@ -205,6 +241,7 @@ class TILINK(object):
                 print("Address threshhold: "+str((cls.smgo & 31) + 19))
                 print("Instruction at address: "+decode_pio(curinst,2,True))
                 return -1
+        time.sleep_ms(1)
         return 0
         
     @classmethod
@@ -223,7 +260,7 @@ class TILINK(object):
             darr[0] = data
             data = darr
         for i in range(0,len(data),4):
-            print("Sent: "+hex(data[i:i+4]))
+            #print("Sent: "+hex(data[i:i+4]))
             if cls.sendchunk(data[i:i+4]) < 0:
                 return -1
         return 0
@@ -245,7 +282,7 @@ class TILINK(object):
         #Critical section begins
         cls.rxsize -= 1
         data = cls.rxbuf[cls.rxbufhead]
-        cls.rxbufhead += 1
+        cls.rxbufhead = (cls.rxbufhead + 1) & 127
         #Critical section ends
         machine.enable_irq(irq_state)
         return data
@@ -266,99 +303,147 @@ class TILINK(object):
     packetsize = 0
     packetdata = bytearray(65536)
 
+    datapackets = {0x06:"VAR",0x15:"DATA",0x36:"SK/E",0x88:"S-DEL",0xA2:"S-REQ",0xC9:"S-RTS"}
+    barepackets = {0x09:"CTS",0x2D:"S-VER",0x56:"ACK",0x5A:"ERR",0x68:"RDY",0x6D:"S-SCR",0x92:"EOT"}
+    @classmethod
+    def sendpacket(cls,packettype,data=bytearray()):
+        e = 0
+        s = ''
+        if packettype in cls.datapackets:
+            #This packet contains data to send
+            size = len(data)
+            chksum = sum(data)
+            e |= cls.send([0x73,packettype,size&255,(size>>8)&255])
+            e |= cls.send(data)
+            e |= cls.send([chksum&255,(chksum>>8)&255])
+            if not e:
+                cls.bytessent += 4+len(data)+2
+            print("SENT "+cls.datapackets[packettype]+" WITH DATA "+hex(data))
+        elif packettype in cls.barepackets:
+            #Packet with no data
+            e |= cls.send([0x73,packettype,0,0])
+            if not e:
+                cls.bytessent += 4
+            print("SENT "+cls.barepackets[packettype])
+        else:
+            raise RuntimeError("Unrecognized packet type. You sent: "+hex(packettype))
+        if e:
+            raise RuntimeError("Error happened during transmit of above packet.")
+
+    #Returns 3-tuple: (machineid,commandid,bytearray(data))
+    @classmethod
+    def getpacket(cls,delay=2000):
+        retry,macid,comid,size = (0,0,0,0)
+        arr2 = bytearray()
+        while retry<4:
+            arr1 = cls.getbytes(4,delay)
+            if delay > 2000:    #IF we have an extralong first packet
+                delay = 2000    #reduce the waiting time for other data incoming
+            if (arr1 == -1) or (len(arr1)<4):
+                raise RuntimeError("Recieved truncated packet. Got: "+hex(arr1))
+            cls.bytesgotten += 4
+            macid = arr1[0]
+            comid = arr1[1]
+            size = arr1[2]+arr1[3]*256
+            if comid in cls.datapackets:
+                #print("GETTING SIZE VAR "+hex(size))
+                arr2 = cls.getbytes(size)
+                if arr2 == -1 or len(arr2)<size:
+                    print("Received bytes: "+hex(arr2))
+                    raise RuntimeError("Incomplete data sent. Expected "+hex(size)+" bytes, got "+hex(len(arr2)))
+                arr3 = cls.getbytes(2)
+                if arr3 == -1 or len(arr3)<2:
+                    raise RuntimeError("Checksum data did not receive")
+                checksum = arr3[0] + arr3[1]*256
+                actual = sum(arr2) & 0xFFFF
+                cls.bytesgotten += size + 2
+                if actual != checksum:
+                    print("Checksum actual/recieved: "+hex([actual,checksum]))
+                    print("Checksum error. Issuing checksum error packet for retry.")
+                    retry += 1
+                    cls.sendpacket(PV.ERR)
+                    continue
+            else:
+                arr2 = bytearray()
+            break
+        if retry>=4:
+            raise RuntimeError("Receive failure: Retried too many times")
+
+        
+        if comid in cls.datapackets:
+            s = cls.datapackets[comid]
+        elif comid in cls.barepackets:
+            s = cls.barepackets[comid]
+        else:
+            s = "UNK ["+hex(arr1)+"] "
+        s = "RECV "+s
+        if arr2:
+            s += " with data sized "+hex(len(arr2))
+        print(s)
+        
+        return PACKET(macid,comid,arr2)
+
     #Note: prevcommand and prevdata is set if you send an initial request
     #and use this function to complete the transaction. Action indicates what
     #you want to do with the transaction if the other two arguments do not
     #supply enough information to make it obvious of what to do
+    varfield = bytearray()
+    vardata = bytearray()
+
     @classmethod
-    def protocol_get(cls,prevcommand = 0, prevdata=[],action = 0):
-        state = 0       #Recieve state. Receiving packet and/or data
-        packet = bytearray(4)
-        arr = bytearray()
-        arr2 = bytearray()
-        machineid = 0
-        commandid = 0
-        delay = 999999  #Wait a really long time for that first packet
-        while True:
-            if 0==state:    #Receiving packet.
-                arr = cls.getbytes(4,delay)
-                delay = 2000    #Go back to waiting 2 secs between each packet.
-                if len(arr)<4:
-                    raise Exception("Truncated base packet. Received "+hex(arr))
-                machineid = arr[0]
-                commandid = arr[1]
-                datalen = arr[2] + arr[3]*256
-                if datalen and commandid in (0x06,0x15,0x36,0x88,0xA2,0xC9):
-                    arr2 = cls.getbytes(datalen)
-                    if arr2 == -1:
-                        raise Exception("Truncated data section. Expected "+hex(datalen)+" bytes, received "+str(arr2))
-                    arr3 = cls.getbytes(2)
-                    if arr2 == -1 or len(arr2) < 2:
-                        raise Exception("Checksum bytes not sent. Recieved: "+str(arr3))
-                    checksum = arr3[0] + arr3[1]*256
-                    if sum(arr2) != checksum:
-                        print("Expected checksum "+str(sum(arr2)+", got "+str(checksum)))
-                        raise Exception("Recieved data does not match checksum.")
-                else:
-                    arr2 = bytearray()
-                state = 1
-                print("Recieved base packet: "+hex(arr))
-                if arr2:
-                    print("Also recieved data: "+hex(arr2))
-            if 1==state:    #Process recieved packet
-                if machineid not in (0x02,0x03,0x23,0x73,0x82,0x83):
-                    raise Exception("Invalid machine ID. Received: "+str(machineid))
-                if 0x09 == commandid:
-                    print("CTS received")
-                    state=0
-                elif 0x06 == commandid:
-                    print("Variable header received: "+str(arr2))
-                    prevdata = arr2[:]
-                    prevcommand = commandid
-                    cls.send([0x73,0x56,0x00,0x00]) #ACK
-                    cls.send([0x73,0x09,0x00,0x00]) #CTS
-                    state=0
-                elif 0x15 == commandid:
-                    print("DATA packet recieved: "+str(arr2))
-                    state=0
-                elif 0x36 == commandid:
-                    print("Skip/Exit packet received: "+str(arr2))
-                    print("Note: Rejection codes: 0x1=EXIT, 0x2=SKIP, 0x3=NOMEM")
-                    state=0
-                elif 0x56 == commandid:
-                    print("ACK packet received.")
-                    state=0
-                elif 0x5A == commandid:
-                    print("Checksum error packet received.")
-                    state=0
-                elif 0x68 == commandid:
-                    print("RDY packet received.")
-                    cls.send([0x73,0x56,0x00,0x00])
-                    state=0
-                elif 0x6D == commandid:
-                    print("Silent screeshot request packet received.")
-                    state=0
-                elif 0x88 == commandid:
-                    print("Silent delete variable request packet received.")
-                    print("Name of variable to delete: "+str(arr2))
-                    state=0
-                elif 0x92 == commandid:
-                    print("End of transmission packet recieved.")
-                    return 0
-                elif 0xA2 == commandid:
-                    print("Silent request variable request received.")
-                    print("Name of variable being requested: "+str(arr2))
-                    state=0
-                elif 0xC9 == commandid:
-                    print("Silent request to send variable request received")
-                    print("Name of variable being sent: "+str(arr2))
-                    state=0
-                else:
-                    print("Unrecognized command byte recieved: "+str(commandid))
-                    state=0
-            pass    #End of 1==state statement
+    def protocol_get(cls,action = 0):
         pass        #End of endless while loop
         return -1
+    
+    @classmethod
+    def protocol_recvar(cls):
+        # Upon calling, the calc should have recieved or about to receive
+        # A request to send variable data from a TI (83+) calculator.
+        # I cannot receive more than one variable. If any more than one is
+        # sent, the prior buffer is discarded.
+        p = cls.getpacket(99999)    #Long wait for first packet
+        cls.bytesgotten = 0
+        cls.bytessent = 0
+        starttime = time.ticks_ms()
+        if p.cid == PV.RDY:
+            cls.sendpacket(PV.ACK)  #Acknolwedge RDY
+        else:
+            print("Did not receive RDY packet. Aborting.")
+            return
+        recv_var = False
+        while True:
+            p = cls.getpacket()     #Receiving whatever
+            if p.cid == PV.RDY:
+                cls.sendpacket(PV.ACK)
+            if p.cid == PV.VAR:
+                cls.varfield = p.data
+                cls.sendpacket(PV.ACK)
+                # At this point, you can examine the varfield data
+                # and either send CTS packet, or send SKIP with error data
+                cls.sendpacket(PV.CTS)
+                recv_var = True #If CTS, set to receive variable data
+            if p.cid == PV.DATA and recv_var == True:
+                cls.vardata = p.data
+                cls.sendpacket(PV.ACK)
+                recv_var = False
+            if p.cid == PV.EOT:
+                cls.sendpacket(PV.ACK)
+                try:
+                    #Flash transfers sometimes sends two EOTs
+                    p = cls.getpacket(200)
+                    if p.cid == PV.EOT:
+                        cls.sendpacket(PV.ACK)
+                except:
+                    pass
+                print("Transfer complete.")
+                print("Bytes received: "+hex(cls.bytesgotten))
+                print("Bytes sent: "+hex(cls.bytessent))
+                print("Time elapsed: "+str(time.ticks_diff(time.ticks_ms(),starttime)/1000))
+                break
+
+
+
+
 
     print("TILINK class initialized")
     
@@ -387,3 +472,5 @@ def dbg():
 def getproto():
     TILINK.protocol_get()
 
+print("RUNNING PROTOCOL RECVAR")
+t.protocol_recvar()
