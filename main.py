@@ -1,7 +1,7 @@
 import micropython
 micropython.alloc_emergency_exception_buf(200)
 from micropython import const
-import uctypes,rp2,time,machine,random,array,collections
+import uctypes,rp2,time,machine,random,array,collections,sys,os
 from machine import Pin
 from rp2 import PIO
 import builtins
@@ -16,6 +16,7 @@ def hex(value):
         return str([builtins.hex(i) for i in value])
     return str([])
 
+PACKET_DEBUG = False
 
 def decode_pio(uint16_val, sideset_bits = 0, sideset_opt = False):
     def di(fbv):    return str(fbv&7)+(" REL" if fbv&16 else "")
@@ -81,6 +82,42 @@ class PV(object):
     EOT = 0x92
     REQ = 0xA2
     RTS = 0xC9
+class VID(object):
+    REAL = 0x00
+    LIST = 0x01
+    MATR = 0x02
+    YVAR = 0x03
+    STR  = 0x04
+    PROG = 0x05
+    PROT = 0x06
+    PIC  = 0x07
+    GDB  = 0x08
+    WIN1 = 0x0B
+    CPLX = 0x0C
+    CLST = 0x0D
+    WNS2 = 0x0F
+    SWNS = 0x10
+    TSET = 0x11
+    BAK  = 0x13
+    DELF = 0x14
+    AVAR = 0x15
+    GRP  = 0x17
+    DIR  = 0x19
+    OS   = 0x23
+    APP  = 0x24
+    IDL  = 0x26
+    CERT = 0x27
+    CLK  = 0x29
+    tostrdict = { 0x00 : "REAL",0x01 : "LIST",0x02 : "MATR",0x03 : "YVAR",0x04 : "STR ",0x05 : "PROG",0x06 : "PROT",0x07 : "PIC ",0x08 : "GDB ",0x0B : "WIN1",0x0C : "CPLX",0x0D : "CLST",0x0F : "WNS2",0x10 : "SWNS",0x11 : "TSET",0x13 : "BAK ",0x14 : "DELF",0x15 : "AVAR",0x17 : "GRP ",0x19 : "DIR ",0x23 : "OS  ",0x24 : "APP ",0x26 : "IDL ",0x27 : "CERT",0x29 : "CLK " }
+    @classmethod
+    def tostring(cls,value):
+        if value in cls.tostrdict:
+            return cls.tostrdict[value]
+        else:
+            return "!"+hex(value)
+
+
+
 class PACKET(object):
     def __init__(self,macid,cmdid,data=bytearray()):
         self.mid = macid
@@ -318,13 +355,15 @@ class TILINK(object):
             e |= cls.send([chksum&255,(chksum>>8)&255])
             if not e:
                 cls.bytessent += 4+len(data)+2
-            print("SENT "+cls.datapackets[packettype]+" WITH DATA "+hex(data))
+            if PACKET_DEBUG:
+                print("SENT "+cls.datapackets[packettype]+" WITH DATA "+hex(data))
         elif packettype in cls.barepackets:
             #Packet with no data
             e |= cls.send([0x73,packettype,0,0])
             if not e:
                 cls.bytessent += 4
-            print("SENT "+cls.barepackets[packettype])
+            if PACKET_DEBUG:
+                print("SENT "+cls.barepackets[packettype])
         else:
             raise RuntimeError("Unrecognized packet type. You sent: "+hex(packettype))
         if e:
@@ -379,7 +418,8 @@ class TILINK(object):
         s = "RECV "+s
         if arr2:
             s += " with data sized "+hex(len(arr2))
-        print(s)
+        if PACKET_DEBUG:
+            print(s)
         
         return PACKET(macid,comid,arr2)
 
@@ -440,9 +480,51 @@ class TILINK(object):
                 print("Bytes sent: "+hex(cls.bytessent))
                 print("Time elapsed: "+str(time.ticks_diff(time.ticks_ms(),starttime)/1000))
                 break
+    @classmethod
+    def formheader(cls,size,vartype,name,isarchived=False,version=0,type2=0):
+        d = bytearray(13)
+        d[0] = size & 255
+        d[1] = (size >> 8) & 255
+        d[2] = vartype
+        d[3:3+len(name)] = bytearray(name)
+        d[11] = version
+        d[12] = (type2 & 127) | (128 if isarchived else 0)
+        return d
 
 
-
+    @classmethod
+    def getvarlist(cls,reportonly = -1):
+        cls.bytesgotten = 0
+        cls.bytessent = 0
+        starttime = time.ticks_ms()
+        cls.sendpacket(PV.REQ,cls.formheader(0,VID.DIR,""))
+        d = cls.getpacket()
+        if d.cid != PV.ACK:
+            print("Variable request failure. Request not acknowledged.")
+            return -1
+        d = cls.getpacket() #Should be data packet containing free RAM
+        print("Free RAM reported: "+hex(d.data[0] + d.data[1] * 256))
+        cls.sendpacket(PV.ACK)
+        while True:
+            d = cls.getpacket()
+            if d.cid == PV.EOT:
+                cls.sendpacket(PV.ACK)
+                print("End of variable list")
+                return 0
+            elif d.cid == PV.VAR:
+                cls.sendpacket(PV.ACK)
+                name = d.data[3:3+8].decode().strip('\x00')
+                size = d.data[0] + d.data[1]*256
+                vtype = d.data[2]
+                ver1 = d.data[11]
+                ver2 = d.data[12] & 127
+                isarc = True if d.data[12] & 128 else False
+                isarcs = "ARCHIVED" if isarc else "IN RAM"
+                if reportonly < 0 or reportonly == vtype:
+                    print("VAR ["+hex(vtype)+"] ("+VID.tostring(vtype)+"): " + name + " , SIZE "+hex(size)+", IS "+isarcs)
+            else:
+                print("Unrecognized packet received. Aborting.")
+                return -1
 
 
     print("TILINK class initialized")
@@ -472,5 +554,8 @@ def dbg():
 def getproto():
     TILINK.protocol_get()
 
-print("RUNNING PROTOCOL RECVAR")
-t.protocol_recvar()
+print("Helpful notes:")
+print("t = TILINK")
+print("Available functions for using TILINK:")
+print("protocol_recvar()")
+print("getvarlist()")

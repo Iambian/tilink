@@ -7,7 +7,7 @@ track of progress and remember what needs to happen to reach my end goal.
 TODO
 ----
 
-* Get directory listing from calc and parse its contents
+* ~~Get directory listing from calc and parse its contents~~
 * Support silent variable requests
 * Think of other protocol doodads that I might need to support
 * Rewrite this whole thing in C so I can do the TinyUSB thing to make my RPI into an MTP device
