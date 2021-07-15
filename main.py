@@ -7,6 +7,9 @@ from rp2 import PIO
 import builtins
 import gc
 
+PACKET_DEBUG = True
+
+
 def hex(value):
     if type(value) is int:
         return builtins.hex(value)
@@ -15,8 +18,6 @@ def hex(value):
     if iter(value) and len(value) > 0:
         return str([builtins.hex(i) for i in value])
     return str([])
-
-PACKET_DEBUG = False
 
 def decode_pio(uint16_val, sideset_bits = 0, sideset_opt = False):
     def di(fbv):    return str(fbv&7)+(" REL" if fbv&16 else "")
@@ -138,6 +139,9 @@ class PACKET(object):
             return a1
 
 class TILINK(object):
+    machine.Pin(0,mode=Pin.IN, pull=Pin.PULL_UP)
+    machine.Pin(1,mode=Pin.IN, pull=Pin.PULL_UP)
+    varlist = []
     print("Initializing TILINK class")
     pin0 = Pin(0)           #BASE PIN THAT OUR STATE MACHINE WILL USE
     pin1 = Pin(1)           #BASE PIN + 1 THAT IS USED FOR JMP_PIN
@@ -151,7 +155,7 @@ class TILINK(object):
         'push_thresh' : 8
     }
     SM_INIT = {
-        'freq' : 500000,
+        'freq' : 750000,
         'in_base' : pin0,
         'sideset_base' : pin0,
         'set_base' : pin0,
@@ -283,7 +287,9 @@ class TILINK(object):
         
     @classmethod
     def reset(cls):
-        cls.sm.restart()
+        cls.sm.restart()                #Resetting state machine and get buffer.
+        cls.rxbuhead = cls.rxbuftail    #It doesn't matter if tail or head is dest
+        cls.rxsize = 0                  #so long as they're equal and size is zero
         cls.sm.active(1)
         machine.mem32[PIO0_BASE+SM0_INSTR] = cls.smgo
 
@@ -346,20 +352,23 @@ class TILINK(object):
     def sendpacket(cls,packettype,data=bytearray()):
         e = 0
         s = ''
+        CALCTYPE = 0x73     #Ti83+/TI84+
         if packettype in cls.datapackets:
             #This packet contains data to send
             size = len(data)
             chksum = sum(data)
-            e |= cls.send([0x73,packettype,size&255,(size>>8)&255])
+            e |= cls.send(bytearray((CALCTYPE,packettype,size&255,(size>>8)&255)))
             e |= cls.send(data)
-            e |= cls.send([chksum&255,(chksum>>8)&255])
+            e |= cls.send(bytearray((chksum&255,(chksum>>8)&255)))
             if not e:
+                print("DBG-A "+hex(cls.bytessent))
                 cls.bytessent += 4+len(data)+2
+                print("DBG-B "+hex(cls.bytessent))
             if PACKET_DEBUG:
                 print("SENT "+cls.datapackets[packettype]+" WITH DATA "+hex(data))
         elif packettype in cls.barepackets:
             #Packet with no data
-            e |= cls.send([0x73,packettype,0,0])
+            e |= cls.send(bytearray((CALCTYPE,packettype,0,0)))
             if not e:
                 cls.bytessent += 4
             if PACKET_DEBUG:
@@ -417,7 +426,7 @@ class TILINK(object):
             s = "UNK ["+hex(arr1)+"] "
         s = "RECV "+s
         if arr2:
-            s += " with data sized "+hex(len(arr2))
+            s += " with data sized "+hex(len(arr2))+", data: "+hex(arr2)
         if PACKET_DEBUG:
             print(s)
         
@@ -494,8 +503,10 @@ class TILINK(object):
 
     @classmethod
     def getvarlist(cls,reportonly = -1):
+        cls.reset()
         cls.bytesgotten = 0
         cls.bytessent = 0
+        cls.varlist = list()
         starttime = time.ticks_ms()
         cls.sendpacket(PV.REQ,cls.formheader(0,VID.DIR,""))
         d = cls.getpacket()
@@ -521,11 +532,94 @@ class TILINK(object):
                 isarc = True if d.data[12] & 128 else False
                 isarcs = "ARCHIVED" if isarc else "IN RAM"
                 if reportonly < 0 or reportonly == vtype:
-                    print("VAR ["+hex(vtype)+"] ("+VID.tostring(vtype)+"): " + name + " , SIZE "+hex(size)+", IS "+isarcs)
+                    cls.varlist.append(d.data)
+                    print("VAR ["+hex(vtype)+"] ("+VID.tostring(vtype)+"): " + name + " , SIZE "+hex(size)+", IS "+isarcs+", PACKETDAT: "+hex(d.data))
             else:
                 print("Unrecognized packet received. Aborting.")
                 return -1
 
+    @classmethod
+    def findvar(cls,name,type=VID.PROG):
+        for i in cls.varlist:
+            if i[3:3+8].decode().strip('\x00') == name:
+                if i[2] == type:
+                    return i    #Returns matching variable header
+        return bytearray()      #Or returns empty if no match
+
+    @classmethod
+    def getvar(cls,vardata,type = -1):
+        cls.reset()
+        #if type specified, vardata is string with name.
+        #otherwise vardata is the result of successful findvar() or similar.
+        if type > -1:
+            data = cls.findvar(vardata,type)
+        else:
+            data = vardata
+        if not data or data not in cls.varlist:
+            print("File "+vardata+" not found. You may need to re-request directory listing.")
+            return -1
+        cls.sendpacket(PV.REQ,data)
+        p = cls.getpacket() #ack
+        p = cls.getpacket() #var with actual header
+        cls.sendpacket(PV.ACK)  #acknowledge var packet
+        if p.data[2:2+9] != data[2:2+9]:
+            print("VAR reply does not match expected value")
+            print("Expected: "+hex(data[2:2+9]))
+            print("Got     : "+hex(p.data[2:2+9]))
+            cls.sendpacket(PV.SKIP,bytearray([1]))  #Send exit packet
+            cls.getpacket()     #It should acknowledge this.
+            return -1
+        cls.sendpacket(PV.CTS)
+        cls.getpacket() #ack
+        p = cls.getpacket() #data
+        cls.sendpacket(PV.ACK)
+        cls.vardata = p.data    #variable buffer for received things.
+        return 0
+
+    @classmethod
+    def sendvar(cls,varheader,vardata):
+        cls.bytesgotten = 0
+        cls.bytessent = 0
+        starttime = time.ticks_ms()
+        cls.reset()
+        cls.sendpacket(PV.RTS,varheader)
+        cls.getpacket()     #ACK
+        p = cls.getpacket() #CTS or SKIP/EXIT
+        if p.cid == PV.SKIP:
+            print("Calc rejected variable with error code: [0x36]/"+hex(p.data[0]))
+            return -1
+        cls.sendpacket(PV.ACK)
+        cls.sendpacket(PV.DATA,vardata)
+        cls.getpacket()     #ACK
+        cls.sendpacket(PV.EOT)
+        print("Transfer complete.")
+        print("Bytes received: "+hex(cls.bytesgotten))
+        print("Bytes sent: "+hex(cls.bytessent))
+        print("Time elapsed: "+str(time.ticks_diff(time.ticks_ms(),starttime)/1000))
+        return 0
+
+    @classmethod
+    def delvar(cls,varheader):
+        cls.reset()
+        cls.sendpacket(PV.DEL,varheader)
+        cls.getpacket()     #ACK del packet
+        if cls.getpacket().cid != PV.ACK:     #ACK actual deletion
+            print("Deletion not acknowledged. Variable probably not deleted.")
+        return 0
+    @classmethod
+    def fromfile(cls,filename=""):
+        with open(filename,"rb") as f:
+            f.read(8+3+42+2+2+2) #skip head,sig,comment,filedatsize,hlen,isize
+            ftype = f.read(1)[0]
+            fname = f.read(8)
+            ver = f.read(1)[0]
+            ver2 = f.read(1)[0]
+            isarc = True if ver2 & 128 else False
+            ver2 &= 127
+            h = f.read(2)
+            size = h[0] + h[1] * 256
+            data = f.read(size)
+            return (cls.formheader(size, ftype, fname, isarc, ver, ver2),data)
 
     print("TILINK class initialized")
     
@@ -554,8 +648,30 @@ def dbg():
 def getproto():
     TILINK.protocol_get()
 
-print("Helpful notes:")
-print("t = TILINK")
-print("Available functions for using TILINK:")
-print("protocol_recvar()")
-print("getvarlist()")
+def emugraylink():
+    import micropython,select,sys
+    print("Begin graylink emulation. REPL being disabled.")
+    micropython.kbd_intr(-1)     #Allows stdin/out to be used as terminal
+    while True:
+        while sys.stdin in select.select([sys.stdin], [],[],0)[0]:
+            c = sys.stdin.buffer.read(1)
+            TILINK.sendchunk(c)
+        else:
+            c = TILINK.get(-1)
+            if c > -1:
+                sys.stdout.buffer.write(bytes([c]))
+
+
+def help():
+    print("Helpful notes:")
+    print("t = TILINK")
+    print("Available functions for using TILINK:")
+    print("t.protocol_recvar()")
+    print("t.getvarlist(reportonly = -1)")
+    print("t.findvar(name,type = VID.PROG)")
+    print("t.getvar(nameorvardat,type = -1)")
+    print("t.sendvar(varheader,vardata)")
+    print("t.delvar(varheader)")
+    print("t.sendvar(*t.fromfile(name))")
+    print("emugraylink() -- Begin graylink emulator")
+help()

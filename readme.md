@@ -17,6 +17,6 @@ TODO
 Special Thanks
 --------------
 
-* Tim
+* Tim (Geekboy1011)
 * The guy who wrote the TI link guide
 * Others
