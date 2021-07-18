@@ -1,3 +1,4 @@
+from _typeshed import NoneType
 import micropython
 micropython.alloc_emergency_exception_buf(200)
 from micropython import const
@@ -79,6 +80,9 @@ ATOMIC_XOR      = const(0x1000)
 ATOMIC_OR       = const(0x02000)
 ATOMIC_AND      = const(0x3000)
 
+
+
+
 class PV(object):
     VAR = 0x06
     CTS = 0x09
@@ -92,29 +96,65 @@ class PV(object):
     EOT = 0x92
     REQ = 0xA2
     RTS = 0xC9
+
+class PACKET(PV):
     data = {0x06:"VAR",0x15:"DATA",0x36:"SK/E",0x88:"DEL",0xA2:"S-REQ",0xC9:"RTS"}
     bare = {0x09:"CTS",0x2D:"VER",0x56:"ACK",0x5A:"ERR",0x68:"RDY",0x6D:"SCR",0x92:"EOT"}
-    
     def __init__(self,macid,cmdid,data=bytearray()):
         self.mid = macid
         self.cid = cmdid
         self.data = data
         if data:
-            self.size = len(data)
-            self.chksum = sum(data)
+            s,c = (len(data),sum(data))
         else:
-            self.size = 0
-            self.chksum = 0
+            s,c = (0,0)
+        self.size_lsb = s & 255
+        self.size_msb = (s >> 8) & 255
+        self.chksum_lsb = c & 255
+        self.chksum_msb = (c >> 8) & 255
+        self.name = self.getname(self.cid)
+        self.base = bytearray([self.mid, self.cid, self.size_lsb, self.size_msb])
 
     def tobytes(self):
-        a1 = bytearray([self.mid,self.cid,self.size & 255,(self.size>>8)*256])
         if self.data:
-            return a1+bytearray(data)+bytearray([self.chksum&255,(self.chksum>>8)*256])
+            return self.base + bytearray(self.data) + bytearray( [self.chksum_lsb, self.chksum_msb])
         else:
-            return a1
+            return self.base
+
+    def tobytesgen(self):
+        for i in self.base:
+            yield bytes(i)
+        if self.data:
+            for i in self.data:
+                yield self.data
 
     @classmethod
-    def packettype(cls,cmdid):
+    def getname(cls,cid):
+        packettype = cls.gettype(cid)
+        if packettype < 0:
+            return "UNK ({:02X})".format(packettype)
+        elif packettype:
+            return cls.data[cid]
+        else:
+            return cls.bare[cid]
+
+    #0 == bare, 1 == contains data, -1 == unknown
+    @classmethod
+    def gettype(cls,cid):
+        if cid in cls.bare:
+            return 0
+        elif cid in cls.data:
+            return 1
+        else:
+            return -1
+
+    @classmethod
+    def formheader(cls,ftype, fname, isarchived = False, ver1 = 0, ver2 = 0):
+        #Create the header necessary for the data represented.
+        #TODO: Also consider supporting backup and FLASH headers
+        pass
+
+    
 
 class VID(object):
     REAL = 0x00
@@ -151,10 +191,56 @@ class VID(object):
             return "!"+hex(value)
 
 
+#Create header object which can return compact notation but also retains
+#easy-to-retrieve data such as types.
+#Alternative constructor format allows you to import packet data and
+#the class will init an instance with easy-to-retrieve data filled out
+class HEADER(object):
+    def __init__(self, ftype_or_packetdata, fname = None, size = 0, isarc = 0, ver1 = 0, ver2 = 0):
+        if fname is None:
+            self = self.__class__.fromheader(ftype_or_packetdata)
+        else:
+            self.ftype = ftype_or_packetdata
+            self.fname = fname
+            self.isarc = True if isarc else False
+            self.ver1  = ver1
+            self.ver2  = ver2
+            self.size  = size
 
+    def toheader(self):
+        if self.ftype > 0x22 and self.ftype < 0x28:
+            raise Exception("Creating flash header not supported")
+        elif self.ftype == 0x13:
+            raise Exception("Creating backup header not supported")
+        else:
+            b = bytearray(13)
+            b[:2] = (self.size&255, (self.size>>8)&255 )
+            b[2]  = self.ftype
+            b[3:len(self.fname)] = self.fname.encode('ascii')
+            b[11] = self.ver1
+            b[12] = self.ver2&127 + (128 if self.isarc else 0)
+        return b
 
-
-
+    #Alternate constructor that creates a HEADER object from the data
+    #of a VAR packet
+    @classmethod
+    def fromheader(cls,packet):
+        header = packet.data
+        t = header[2]
+        if t > 0x22 and t < 0x28:
+            raise Exception("Reading flash header not supported")
+        elif t == 0x13:
+            raise Exception("Reading backup header not supported")
+        else:
+            s = header[0]+header[1]*256
+            n = header[3:11].decode().strip('\x00')
+            a = True if header[12] & 128 else False
+            v1= header[11]
+            v2= header[12] & 127
+            obj = cls.__new__(cls)
+            obj.__init__(t,n,s,a,v1,v2)
+            return obj
+        
 class TISERIAL(object):
     # PIO initializations
     PININIT = (PIO.OUT_LOW,PIO.OUT_LOW)
@@ -259,6 +345,9 @@ class TISERIAL(object):
         starttime = time.ticks_ms()
         #If in tx mode, set to rx mode and proceed to wait for incoming data
         if machine.mem32[self.smreg(SM0_ADDR)] >= self.smtx:
+            #spinlock for up to 10 ms if still sending data (tx not stalled)
+            while not (machine.mem32[self.smreg(SM0_EXECCTRL)] & SM_EXEC_STALLED) and time.ticks_diff(time.ticks_ms(),starttime) < 10:
+                pass
             machine.mem32[self.smreg(SM0_INSTR)] = self.smrx
         #Wait for incoming data
         while True:
@@ -268,7 +357,7 @@ class TISERIAL(object):
             if not machine.mem32[self.piobase()+PIO_FSTAT] & (1 << (PIO_RXEMPTY+self.id)):
                 return self.rx_fifo()
 
-    def put(self,timeout_ms = -1):
+    def put(self,byte,timeout_ms = -1):
         starttime = time.ticks_ms()
         #Check to see if we're in receive mode. If so, switch to transmit mode
         if machine.mem32[self.smreg(SM0_ADDR)] < self.smtx:
@@ -280,6 +369,7 @@ class TISERIAL(object):
                 if time.ticks_diff(time.ticks_ms(),starttime) > timeout_ms:
                     self.restart()
                     return -1
+        self.tx_fifo(byte)
         return 0
         
 
@@ -287,8 +377,26 @@ class TIPROTO(TISERIAL):
     def __init__(self,*args,**kwargs):
         super(TIPROTO,self).__init__(*args,**kwargs)
 
-
     def getpacket(self):
+        mid = self.get(2000)
+        cid = self.get(100)
+        lsb = self.get(100)
+        msb = self.get(100)
+        size = lsb+msb*256
+        if size > 16384:
+            raise Exception("Large data packets (>16384) not supported yet")
+        if PACKET.gettype(cid) == 1:
+            return PACKET(mid, cid, bytearray((self.get(1000) for i in range(size))))
+        else:
+            return PACKET(mid,cid)
+
+    def sendpacket(self,packet):
+        start_timeout = 2000
+        for i in packet.tobytesgen():
+            self.put(i,start_timeout)
+
+
+
 
 
     
