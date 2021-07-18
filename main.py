@@ -1,4 +1,4 @@
-from _typeshed import NoneType
+
 import micropython
 micropython.alloc_emergency_exception_buf(200)
 from micropython import const
@@ -383,8 +383,8 @@ class TIPROTO(TISERIAL):
         lsb = self.get(100)
         msb = self.get(100)
         size = lsb+msb*256
-        if size > 16384:
-            raise Exception("Large data packets (>16384) not supported yet")
+        if size > 27000:
+            raise Exception("Large data packets (>27000) not supported yet")
         if PACKET.gettype(cid) == 1:
             return PACKET(mid, cid, bytearray((self.get(1000) for i in range(size))))
         else:
