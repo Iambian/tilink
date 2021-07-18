@@ -4,3 +4,39 @@
 
 
 
+rxstart:
+    mov osr,pins            side 0
+    out x,1                 side 0
+    jmp !x, rx0             side 0
+    jmp pin, rxstart        side 0
+rx1:
+    wait 1 pin 1            side 1
+    wait 1 pin 0            side 0
+    jmp rxcontinue
+rx0:
+    jmp pin, rx0continue    side 0
+    jmp rxerror             side 0
+rx0continue:
+    wait 1 pin 0            side 2
+    wait 1 pin 1            side 0
+rxcontinue:
+    in x,1                  side 0
+    jmp rxstart             side 0
+
+txstart:
+txloop:
+    out x,1                 side 0
+    jmp !x, tx0             side 0
+tx1:
+    wait 0 pin 0            side 2
+    jmp txend               side 0
+tx0:
+    wait 0 pin 1            side 1
+    wait 1 pin 0            side 0
+txend:
+    wait 1 pin 1            side 0
+    jmp txloop              side 0
+
+rxerror:
+    jmp rxerror             side 0
+
