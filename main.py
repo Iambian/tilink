@@ -241,6 +241,13 @@ class HEADER(object):
             obj.__init__(t,n,s,a,v1,v2)
             return obj
         
+
+''' 
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+'''
 class TISERIAL(object):
     # PIO initializations
     PININIT = (PIO.OUT_LOW,PIO.OUT_LOW)
@@ -259,7 +266,7 @@ class TISERIAL(object):
         jmp(pin, "0")           .side(0)      # 3
         wait(1, pin, 1)         .side(1)      # 4
         wait(1, pin, 0)         .side(0)      # 5
-        jmp("11")                             # 6
+        jmp("11")               .side(0)      # 6
         label("7")
         jmp(pin, "9")           .side(0)      # 7
         jmp("21")               .side(0)      # 8
@@ -309,12 +316,12 @@ class TISERIAL(object):
             basepin = self.id * 2 + (8 if self.core else 0)
         pin0 = machine.Pin(basepin+0,mode=Pin.IN, pull=Pin.PULL_UP)
         pin1 = machine.Pin(basepin+1,mode=Pin.IN, pull=Pin.PULL_UP)
-        SMINIT = {
-            'freq': 750000,
+        self.SMINIT = {
+            'freq': 100000,
             'in_base': pin0, 'set_base': pin0, 'sideset_base': pin0, 'jmp_pin': pin1,
             'in_shiftdir': PIO.SHIFT_RIGHT, 'out_shiftdir': PIO.SHIFT_RIGHT,
         }
-        self.sm = rp2.StateMachine(statemachine,TISERIAL.pio,**SMINIT)
+        self.sm = rp2.StateMachine(statemachine,TISERIAL.pio,**self.SMINIT)
         self.pio_offset = TISERIAL.pio[2 if self.core else 1]
         self.smstop = self.pio_offset + len(TISERIAL.pio[0]) - 1
         self.smrx   = self.pio_offset + 0
@@ -322,24 +329,29 @@ class TISERIAL(object):
         self.rxbuf  = bytearray(16)
         self.rxbhead = 0
         self.rxbtail = 0
-
         self.restart()
 
     def piobase(self):
-        return 0x503000C8 if self.core else 0x502000C8
+        return 0x50300000 if self.core else 0x50200000
     #Returns address based on sm0 offset. Valid for CLKDIV to PINCTRL.
     def smreg(self,sm0offset):
-        return (0x503000C8 if self.core else 0x502000C8) + 0x18*self.id
+        sm0offset -= 0x00C8 #SM0_CLKDIV
+        return (0x503000C8 if self.core else 0x502000C8) + 0x18*self.id + sm0offset
     #Returns fifo address
     def tx_fifo(self,value):
         machine.mem32[(0x50300010 if self.core else 0x50200010) + 4 * self.id] = value
     def rx_fifo(self):
-        return machine.mem32[(0x50300010 if self.core else 0x50200010) + 4 * self.id]
+        return machine.mem32[(0x50300020 if self.core else 0x50200020) + 4 * self.id]
 
-    def restart(self):
-        machine.mem32[self.smreg(SM0_INSTR)] = 0x1F  #Halts state machine
-        machine.mem32[self.piobase()+PIO_CTRL] = 1 << PIO_CTRL_RESET
-        machine.mem32[self.smreg(SM0_INSTR)] = self.smrx
+    def restart(self,txmode = False):
+        self.sm.active(1)
+        #The instruction below does side 0 whether or not sideset_opt is set.
+        machine.mem32[self.smreg(SM0_INSTR)] = 0x1F | ((machine.mem32[self.smreg(SM0_EXECCTRL)]>>30&1)<<12)
+        machine.mem32[self.piobase()+PIO_CTRL] |= 1 << PIO_CTRL_RESET
+        if txmode:
+            machine.mem32[self.smreg(SM0_INSTR)] = self.smtx
+        else:
+            machine.mem32[self.smreg(SM0_INSTR)] = self.smrx
 
     def get(self,timeout_ms = -1):
         starttime = time.ticks_ms()
@@ -351,31 +363,52 @@ class TISERIAL(object):
             machine.mem32[self.smreg(SM0_INSTR)] = self.smrx
         #Wait for incoming data
         while True:
+            if not machine.mem32[self.piobase()+PIO_FSTAT] & (1 << (PIO_RXEMPTY+self.id)):
+                return (self.rx_fifo() >> 24) & 255
             if time.ticks_diff(time.ticks_ms(),starttime) > timeout_ms:
                 self.restart()
                 return -1
-            if not machine.mem32[self.piobase()+PIO_FSTAT] & (1 << (PIO_RXEMPTY+self.id)):
-                return self.rx_fifo()
 
     def put(self,byte,timeout_ms = -1):
         starttime = time.ticks_ms()
-        #Check to see if we're in receive mode. If so, switch to transmit mode
+        #Check to see if we're in receive mode. If so, restart in transmit mode
         if machine.mem32[self.smreg(SM0_ADDR)] < self.smtx:
-            machine.mem32[self.smreg(SM0_INSTR)] = self.smtx
-        #If tx is full, start the timeout process
-        if machine.mem32[self.piobase()+PIO_FSTAT] & (1 << (PIO_TXFULL+self.id)):
-            starttime = time.ticks_ms()
-            while True:
-                if time.ticks_diff(time.ticks_ms(),starttime) > timeout_ms:
-                    self.restart()
-                    return -1
+            self.restart(True)
+        #Timeout if tx remains full for too long
+        starttime = time.ticks_ms()
+        while True:
+            if not (machine.mem32[self.piobase()+PIO_FSTAT] & (1 << (PIO_TXFULL+self.id))):
+                break
+            if time.ticks_diff(time.ticks_ms(),starttime) > timeout_ms:
+                self.restart()
+                return -1
         self.tx_fifo(byte)
         return 0
+
+    ## REMOVE THE DEBUG FUNCTIONS WHEN DONE TESTING
+    def dbg_printadr(self,ending='\n'):
+        if ending=='\n':
+            print("Stalled?  "+str(True if machine.mem32[self.smreg(SM0_EXECCTRL)]>>31&1 else False))
+            print("SIDE_EN?  "+str(True if machine.mem32[self.smreg(SM0_EXECCTRL)]>>30&1 else False))
+            print("S_PINDIR? "+str(True if machine.mem32[self.smreg(SM0_EXECCTRL)]>>29&1 else False))
+            print("")
+        print("Curinst: {i} @ adr {a}       ".format(i=decode_pio(machine.mem32[self.smreg(SM0_INSTR)],2,True),a=hex(machine.mem32[self.smreg(SM0_ADDR)])),end=ending)
+    def dbg(self):
+        while True:
+            self.dbg_printadr('\r')
+            
+''' 
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+'''
         
 
 class TIPROTO(TISERIAL):
     def __init__(self,*args,**kwargs):
         super(TIPROTO,self).__init__(*args,**kwargs)
+        self.machineid = 0x73
 
     def getpacket(self):
         mid = self.get(2000)
@@ -394,11 +427,15 @@ class TIPROTO(TISERIAL):
         start_timeout = 2000
         for i in packet.tobytesgen():
             self.put(i,start_timeout)
+            start_timeout = -1
+
+    def sendack(self):
+        self.sendpacket(PACKET(self.machineid,PV.ACK))
+    
 
 
 
-
-
+t = TIPROTO()
     
 def emugraylink():
     import micropython,select,sys
@@ -416,14 +453,21 @@ def emugraylink():
 
 def help():
     print("Helpful notes:")
-    print("Available classes:")
-    print("PV(object): List of packet commands")
-    print("PACKET(PV): Implements packets. init, tobytes, tobytesgen, #getname, #gettype, #formheader")
-    print("VID(object): List of variable types. #tostring")
-    print("HEADER(object): Constructs header data from variable stats. toheader, #fromheader")
-    print("TISERIAL(object): Implements TI DBUS protocol. init state machine, restart, get, put")
-    print("TIPROTO(TISERIAL): Implements rx/tx of packets")
-    print("TODO: Add functions to TIPROTO to perform actual actions (e.g. get var, get var list, send vars)")
-    print("emugraylink() -- Begin graylink emulator")
-    print("TODO: Fix emugraylink() to use new TISERIAL class")
+    print("* Available classes:")
+    print("  PV(object): List of packet commands")
+    print("  PACKET(PV): Implements packets. init, tobytes, tobytesgen, #getname, #gettype, #formheader")
+    print("  VID(object): List of variable types. #tostring")
+    print("  HEADER(object): Constructs header data from variable stats. toheader, #fromheader")
+    print("  TISERIAL(object): Implements TI DBUS protocol. init state machine, restart, get, put")
+    print("  TIPROTO(TISERIAL): Implements rx/tx of packets")
+    print("* TODO: Add functions to TIPROTO to perform actual actions (e.g. get var, get var list, send vars)")
+    print("* Available functions and shorthand mappings")
+    print("  t = TIPROTO() : Init and autoassigns to first mapping (0)")
+    print("  emugraylink() -- Begin graylink emulator. [THIS DISABLES THE REPL. DISCONNECT FROM VSCODE AFTER USING]")
+    print("* TODO: Fix emugraylink() to use new TISERIAL class")
+    print("Debugging calls: ")
+    print("t.dbg() : Infinite loop displaying current PIO instruction")
+    print("t.dbg_printadr() : Prints the immediate address and if SM has stalled")
 help()
+
+
