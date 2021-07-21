@@ -123,10 +123,10 @@ class PACKET(PV):
 
     def tobytesgen(self):
         for i in self.base:
-            yield bytes(i)
+            yield i
         if self.data:
             for i in self.data:
-                yield self.data
+                yield i
 
     @classmethod
     def getname(cls,cid):
@@ -356,14 +356,18 @@ class TISERIAL(object):
     def get(self,timeout_ms = -1):
         starttime = time.ticks_ms()
         #If in tx mode, set to rx mode and proceed to wait for incoming data
+
         if machine.mem32[self.smreg(SM0_ADDR)] >= self.smtx:
-            #spinlock for up to 10 ms if still sending data (tx not stalled)
-            while not (machine.mem32[self.smreg(SM0_EXECCTRL)] & SM_EXEC_STALLED) and time.ticks_diff(time.ticks_ms(),starttime) < 10:
+            #Immediately exit if tx not empty (still sending)
+            if not machine.mem32[self.piobase()+PIO_FSTAT]&(1<<(PIO_TXEMPTY+self.id)):
+                return -1
+            #spinlock for up to 100 ms if still sending the remaining byte
+            while time.ticks_diff(time.ticks_ms(),starttime) < 50:
                 pass
             machine.mem32[self.smreg(SM0_INSTR)] = self.smrx
         #Wait for incoming data
         while True:
-            if not machine.mem32[self.piobase()+PIO_FSTAT] & (1 << (PIO_RXEMPTY+self.id)):
+            if not machine.mem32[self.piobase()+PIO_FSTAT]&(1<<(PIO_RXEMPTY+self.id)):
                 return (self.rx_fifo() >> 24) & 255
             if time.ticks_diff(time.ticks_ms(),starttime) > timeout_ms:
                 self.restart()
@@ -410,8 +414,8 @@ class TIPROTO(TISERIAL):
         super(TIPROTO,self).__init__(*args,**kwargs)
         self.machineid = 0x73
 
-    def getpacket(self):
-        mid = self.get(2000)
+    def getpacket(self,start_timeout = 2000):
+        mid = self.get(start_timeout)
         cid = self.get(100)
         lsb = self.get(100)
         msb = self.get(100)
@@ -439,14 +443,17 @@ t = TIPROTO()
     
 def emugraylink():
     import micropython,select,sys
+    global t
     print("Begin graylink emulation. REPL being disabled.")
     micropython.kbd_intr(-1)     #Allows stdin/out to be used as terminal
     while True:
         while sys.stdin in select.select([sys.stdin], [],[],0)[0]:
             c = sys.stdin.buffer.read(1)
-            TILINK.sendchunk(c)
+            if len(c) == 1:
+                #print(c[0])
+                t.put(c[0])
         else:
-            c = TILINK.get(-1)
+            c = t.get(-1)
             if c > -1:
                 sys.stdout.buffer.write(bytes([c]))
 
