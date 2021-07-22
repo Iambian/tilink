@@ -1,0 +1,76 @@
+.program TILINK
+.side_set 2 opt
+
+;execctrl: 0:3 status_n. Set to 1 then status_sel to 0 to read txfifo
+;then status =1s if FIFO<N (empty), else TX FIFO not empty
+;autopush enable for rxcontinue. framing is still done. removes one PUSH.
+
+.wrap_target
+
+looprestart:
+    set y,7
+mainloop:
+    mov x,status        side 0
+    jmp !x,txstart
+rx_active:
+    mov osr,pins        side 0
+    out x,1
+    jmp !x, rx0start
+    jmp pin, mainloop
+rx1start:
+    wait 1 pin 1        side 1
+    wait 1 pin 0        side 0
+    jmp rxcontinue
+rx0start:
+    jmp pin,rx0continue
+    jmp error
+rx0continue:
+    wait 1 pin 0        side 2
+    wait 1 pin 1        side 0
+rxcontinue:
+    in x,1
+    jmp y--,rxsuperactive
+    jmp looprestart
+rxsuperactive:
+    mov osr,pins
+    out x,1
+    jmp !x, rx0start
+    jmp pin,rxsuperactive
+    jmp rx1start
+
+txstart:
+    pull
+txloop:
+    out x,1
+    jmp !x, tx0start
+tx1start:
+    wait 0 pin 0            side 2
+    jmp txcontinue
+tx0start:
+    wait 0 pin 1            side 1
+    wait 1 pin 0            side 0
+txcontinue:
+    wait 1 pin 1            side 0
+    jmp y--,txloop
+.wrap
+
+error:
+    jmp error
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

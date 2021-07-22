@@ -12,7 +12,7 @@ rxstart:
 rx1:
     wait 1 pin 1            side 1
     wait 1 pin 0            side 0
-    jmp rxcontinue
+    jmp rxcontinue          side 0
 rx0:
     jmp pin, rx0continue    side 0
     jmp rxerror             side 0

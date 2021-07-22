@@ -253,49 +253,65 @@ class TISERIAL(object):
     PININIT = (PIO.OUT_LOW,PIO.OUT_LOW)
     PIOINIT = {
         'out_init':PININIT, 'set_init':PININIT,'sideset_init':PININIT,
-        'autopull': True, 'pull_thresh': 8,
+        'autopull': False, 'pull_thresh': 8,
         'autopush': True, 'push_thresh': 8,
     }
     @rp2.asm_pio(**PIOINIT)
     def pio():
         wrap_target()
         label("0")
-        mov(osr, pins)          .side(0)      # 0
-        out(x, 1)               .side(0)      # 1
-        jmp(not_x, "7")         .side(0)      # 2
-        jmp(pin, "0")           .side(0)      # 3
-        wait(1, pin, 1)         .side(1)      # 4
-        wait(1, pin, 0)         .side(0)      # 5
-        jmp("11")               .side(0)      # 6
+        set(y, 7)               .side(0)      # 0
+        label("1")
+        mov(x, status)          .side(0)      # 1
+        jmp(not_x, "22")                      # 2
+        mov(osr, pins)          .side(0)      # 3
+        out(x, 1)                             # 4
+        jmp(not_x, "10")                      # 5
+        jmp(pin, "1")                         # 6
         label("7")
-        jmp(pin, "9")           .side(0)      # 7
-        jmp("21")               .side(0)      # 8
-        label("9")
-        wait(1, pin, 0)         .side(2)      # 9
-        wait(1, pin, 1)         .side(0)      # 10
-        label("11")
-        in_(x, 1)               .side(0)      # 11
-        jmp("0")                .side(0)      # 12
-        label("13")
-        out(x, 1)               .side(0)      # 13
-        jmp(not_x, "17")        .side(0)      # 14
-        wait(0, pin, 0)         .side(2)      # 15
-        jmp("19")               .side(0)      # 16
+        wait(1, pin, 1)         .side(1)      # 7
+        wait(1, pin, 0)         .side(0)      # 8
+        jmp("14")                             # 9
+        label("10")
+        jmp(pin, "12")                        # 10
+        jmp("31")                             # 11
+        label("12")
+        wait(1, pin, 0)         .side(2)      # 12
+        wait(1, pin, 1)         .side(0)      # 13
+        label("14")
+        in_(x, 1)                             # 14
+        jmp(y_dec, "17")                      # 15
+        jmp("0")                              # 16
         label("17")
-        wait(0, pin, 1)         .side(1)      # 17
-        wait(1, pin, 0)         .side(0)      # 18
-        label("19")
-        wait(1, pin, 1)         .side(0)      # 19
-        jmp("13")               .side(0)      # 20
-        label("21")
-        jmp("21")               .side(0)      # 21
+        mov(osr, pins)                        # 17
+        out(x, 1)                             # 18
+        jmp(not_x, "10")                      # 19
+        jmp(pin, "17")                        # 20
+        jmp("7")                              # 21
+        label("22")
+        pull(block)                           # 22
+        label("23")
+        out(x, 1)                             # 23
+        jmp(not_x, "27")                      # 24
+        wait(0, pin, 0)         .side(2)      # 25
+        jmp("29")                             # 26
+        label("27")
+        wait(0, pin, 1)         .side(1)      # 27
+        wait(1, pin, 0)         .side(0)      # 28
+        label("29")
+        wait(1, pin, 1)         .side(0)      # 29
+        jmp(y_dec, "23")                      # 30
         wrap()
-    pio[3] |= 1 << 29    #Sets sideset mode to pindirs.
+        label("31")
+        jmp("31")                             # 31
+    pio[3] |= (1 << 29) + 1    #Sets sideset mode to pindirs. Set status_n to 1
 
     statemachines = dict()  #Contains all initialized state machines
 
     def __init__(self,statemachine = -1, basepin = -1):
-        #Check if we already instantiated this. If so, reuse, else init.
+        #
+        # Check if we already instantiated this. If so, reuse, else init.
+        #
         if statemachine == -1:
             for i in range(4):
                 if i not in TISERIAL.statemachines:
@@ -310,6 +326,9 @@ class TISERIAL(object):
                 return
             else:
                 TISERIAL.statemachines[statemachine] = self
+        #
+        # State machine now chosen. Put together the rest of everything.
+        #
         self.id = statemachine & 3
         self.core = (statemachine & 8) >> 3     #NOT IMPLEMENTED. FOR FUTURE USE
         if basepin < 0:
@@ -317,19 +336,16 @@ class TISERIAL(object):
         pin0 = machine.Pin(basepin+0,mode=Pin.IN, pull=Pin.PULL_UP)
         pin1 = machine.Pin(basepin+1,mode=Pin.IN, pull=Pin.PULL_UP)
         self.SMINIT = {
-            'freq': 100000,
+            'freq': 500000,
             'in_base': pin0, 'set_base': pin0, 'sideset_base': pin0, 'jmp_pin': pin1,
             'in_shiftdir': PIO.SHIFT_RIGHT, 'out_shiftdir': PIO.SHIFT_RIGHT,
         }
         self.sm = rp2.StateMachine(statemachine,TISERIAL.pio,**self.SMINIT)
-        self.pio_offset = TISERIAL.pio[2 if self.core else 1]
-        self.smstop = self.pio_offset + len(TISERIAL.pio[0]) - 1
-        self.smrx   = self.pio_offset + 0
-        self.smtx   = self.pio_offset + 13  #From tx occurance of 'out x,1'
-        self.rxbuf  = bytearray(16)
-        self.rxbhead = 0
-        self.rxbtail = 0
-        self.restart()
+        self.sm.active(1)
+        return
+
+
+
 
     def piobase(self):
         return 0x50300000 if self.core else 0x50200000
@@ -343,52 +359,27 @@ class TISERIAL(object):
     def rx_fifo(self):
         return machine.mem32[(0x50300020 if self.core else 0x50200020) + 4 * self.id]
 
-    def restart(self,txmode = False):
-        self.sm.active(1)
-        #The instruction below does side 0 whether or not sideset_opt is set.
-        machine.mem32[self.smreg(SM0_INSTR)] = 0x1F | ((machine.mem32[self.smreg(SM0_EXECCTRL)]>>30&1)<<12)
-        machine.mem32[self.piobase()+PIO_CTRL] |= 1 << PIO_CTRL_RESET
-        if txmode:
-            machine.mem32[self.smreg(SM0_INSTR)] = self.smtx
-        else:
-            machine.mem32[self.smreg(SM0_INSTR)] = self.smrx
 
     def get(self,timeout_ms = -1):
         starttime = time.ticks_ms()
         #If in tx mode, set to rx mode and proceed to wait for incoming data
-
-        if machine.mem32[self.smreg(SM0_ADDR)] >= self.smtx:
-            #Immediately exit if tx not empty (still sending)
-            if not machine.mem32[self.piobase()+PIO_FSTAT]&(1<<(PIO_TXEMPTY+self.id)):
-                return -1
-            #spinlock for up to 100 ms if still sending the remaining byte
-            while time.ticks_diff(time.ticks_ms(),starttime) < 50:
-                pass
-            machine.mem32[self.smreg(SM0_INSTR)] = self.smrx
-        #Wait for incoming data
         while True:
-            if not machine.mem32[self.piobase()+PIO_FSTAT]&(1<<(PIO_RXEMPTY+self.id)):
-                return (self.rx_fifo() >> 24) & 255
+            if self.sm.rx_fifo() > 0:
+                return self.sm.get()>>24&255
             if time.ticks_diff(time.ticks_ms(),starttime) > timeout_ms:
-                self.restart()
+                self.sm.restart()
                 return -1
 
     def put(self,byte,timeout_ms = -1):
         starttime = time.ticks_ms()
-        #Check to see if we're in receive mode. If so, restart in transmit mode
-        if machine.mem32[self.smreg(SM0_ADDR)] < self.smtx:
-            self.restart(True)
-        #Timeout if tx remains full for too long
-        starttime = time.ticks_ms()
         while True:
-            if not (machine.mem32[self.piobase()+PIO_FSTAT] & (1 << (PIO_TXFULL+self.id))):
-                break
+            if self.sm.tx_fifo() < 1:
+                self.sm.put(byte)
+                return 0
             if time.ticks_diff(time.ticks_ms(),starttime) > timeout_ms:
-                self.restart()
+                self.sm.restart()
                 return -1
-        self.tx_fifo(byte)
-        return 0
-
+            
     ## REMOVE THE DEBUG FUNCTIONS WHEN DONE TESTING
     def dbg_printadr(self,ending='\n'):
         if ending=='\n':
