@@ -297,9 +297,9 @@ class TISERIAL(object):
         jmp("29")                             # 26
         label("27")
         wait(0, pin, 1)         .side(1)      # 27
-        wait(1, pin, 0)         .side(0)      # 28
+        wait(1, pin, 1)         .side(0)      # 28
         label("29")
-        wait(1, pin, 1)         .side(0)      # 29
+        wait(1, pin, 0)         .side(0)      # 29
         jmp(y_dec, "23")                      # 30
         wrap()
         label("31")
@@ -336,7 +336,7 @@ class TISERIAL(object):
         pin0 = machine.Pin(basepin+0,mode=Pin.IN, pull=Pin.PULL_UP)
         pin1 = machine.Pin(basepin+1,mode=Pin.IN, pull=Pin.PULL_UP)
         self.SMINIT = {
-            'freq': 500000,
+            'freq': 300000,
             'in_base': pin0, 'set_base': pin0, 'sideset_base': pin0, 'jmp_pin': pin1,
             'in_shiftdir': PIO.SHIFT_RIGHT, 'out_shiftdir': PIO.SHIFT_RIGHT,
         }
@@ -367,7 +367,7 @@ class TISERIAL(object):
             if self.sm.rx_fifo() > 0:
                 return self.sm.get()>>24&255
             if time.ticks_diff(time.ticks_ms(),starttime) > timeout_ms:
-                self.sm.restart()
+                #self.sm.restart()
                 return -1
 
     def put(self,byte,timeout_ms = -1):
@@ -377,7 +377,7 @@ class TISERIAL(object):
                 self.sm.put(byte)
                 return 0
             if time.ticks_diff(time.ticks_ms(),starttime) > timeout_ms:
-                self.sm.restart()
+                #self.sm.restart()
                 return -1
             
     ## REMOVE THE DEBUG FUNCTIONS WHEN DONE TESTING
@@ -421,8 +421,9 @@ class TIPROTO(TISERIAL):
     def sendpacket(self,packet):
         start_timeout = 2000
         for i in packet.tobytesgen():
+            #print(i)
             self.put(i,start_timeout)
-            start_timeout = -1
+            start_timeout = 2000
 
     def sendack(self):
         self.sendpacket(PACKET(self.machineid,PV.ACK))
@@ -435,18 +436,25 @@ t = TIPROTO()
 def emugraylink():
     import micropython,select,sys
     global t
-    print("Begin graylink emulation. REPL being disabled.")
-    micropython.kbd_intr(-1)     #Allows stdin/out to be used as terminal
+    #print("Begin graylink emulation. REPL being disabled.")
+    #micropython.kbd_intr(-1)     #Allows stdin/out to be used as terminal
     while True:
         while sys.stdin in select.select([sys.stdin], [],[],0)[0]:
             c = sys.stdin.buffer.read(1)
             if len(c) == 1:
                 #print(c[0])
-                t.put(c[0])
+                t.put(c[0],2000)
         else:
-            c = t.get(-1)
+            c = t.get()
             if c > -1:
                 sys.stdout.buffer.write(bytes([c]))
+
+def tightloop():
+    a = []
+    for i in range(ord('A'),ord('Q')+1):
+        t.put(i,50)
+        a.append(t.get())
+    print(a)
 
 
 def help():

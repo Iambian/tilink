@@ -48,9 +48,9 @@ tx1start:
     jmp txcontinue
 tx0start:
     wait 0 pin 1            side 1
-    wait 1 pin 0            side 0
-txcontinue:
     wait 1 pin 1            side 0
+txcontinue:
+    wait 1 pin 0            side 0
     jmp y--,txloop
 .wrap
 
