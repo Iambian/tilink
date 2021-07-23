@@ -336,7 +336,7 @@ class TISERIAL(object):
         pin0 = machine.Pin(basepin+0,mode=Pin.IN, pull=Pin.PULL_UP)
         pin1 = machine.Pin(basepin+1,mode=Pin.IN, pull=Pin.PULL_UP)
         self.SMINIT = {
-            'freq': 300000,
+            'freq': 900000,
             'in_base': pin0, 'set_base': pin0, 'sideset_base': pin0, 'jmp_pin': pin1,
             'in_shiftdir': PIO.SHIFT_RIGHT, 'out_shiftdir': PIO.SHIFT_RIGHT,
         }
@@ -437,13 +437,13 @@ def emugraylink():
     import micropython,select,sys
     global t
     #print("Begin graylink emulation. REPL being disabled.")
-    #micropython.kbd_intr(-1)     #Allows stdin/out to be used as terminal
+    micropython.kbd_intr(-1)     #Allows stdin/out to be used as terminal
     while True:
         while sys.stdin in select.select([sys.stdin], [],[],0)[0]:
             c = sys.stdin.buffer.read(1)
             if len(c) == 1:
                 #print(c[0])
-                t.put(c[0],2000)
+                t.put(c[0],50)
         else:
             c = t.get()
             if c > -1:
