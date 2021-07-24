@@ -52,42 +52,15 @@ def decode_pio(uint16_val, sideset_bits = 0, sideset_opt = False):
     if de:  s+=" ["+str(de)+"]"
     return s
 
-PIO0_BASE       = const(0x50200000)
-PIO_CTRL        = const(0x0000)
-PIO_CTRL_ENABLE = const(0)
-PIO_CTRL_RESET  = const(4)
-PIO_CTRL_CLKDIV_RESTART = const(8)
-PIO_FSTAT       = const(0x0004)
-PIO_RXFULL      = const(0)
-PIO_RXEMPTY     = const(8)
-PIO_TXFULL      = const(16)
-PIO_TXEMPTY     = const(24)
-PIO_FLEVEL      = const(0x000C)
-PIO_TXF0        = const(0x0010)
-PIO_RXF0        = const(0x0020)
-PIO_IRQ         = const(0x0030)
-PIO_IRQ_FORCE   = const(0x0034)
 SM0_EXECCTRL    = const(0x00CC)
-SM_EXEC_STALLED = const(31)
-SM0_SHIFTCTRL   = const(0x00D0)
-SM0_PINCTRL     = const(0x00DC)
 SM0_ADDR        = const(0x00D4)
 SM0_INSTR       = const(0x00D8)
-PIO_IRQ0_INTE   = const(0x012C)
-
-ATOMIC_NORMAL   = const(0x0000)
-ATOMIC_XOR      = const(0x1000)
-ATOMIC_OR       = const(0x02000)
-ATOMIC_AND      = const(0x3000)
-
-
-
 
 class PV(object):
     VAR = 0x06
     CTS = 0x09
     DATA = 0x15
-    VER = 0x2D
+    VER  = 0x2D
     SKIP = 0x36
     ACK = 0x56
     ERR = 0x5A
@@ -127,6 +100,8 @@ class PACKET(PV):
         if self.data:
             for i in self.data:
                 yield i
+            yield self.chksum_lsb
+            yield self.chksum_msb
 
     @classmethod
     def getname(cls,cid):
@@ -154,93 +129,90 @@ class PACKET(PV):
         #TODO: Also consider supporting backup and FLASH headers
         pass
 
+    def __str__(self):
+        return "<{0} type {1} data {2} from machine {4} chksum {3}>".format(type(self).__name__, self.getname(self.cid), hex(self.data), hex((self.chksum_lsb, self.chksum_msb)), hex(self.mid))
+
     
 
 class VID(object):
-    REAL = 0x00
-    LIST = 0x01
-    MATR = 0x02
-    YVAR = 0x03
-    STR  = 0x04
-    PROG = 0x05
-    PROT = 0x06
-    PIC  = 0x07
-    GDB  = 0x08
-    WIN1 = 0x0B
-    CPLX = 0x0C
-    CLST = 0x0D
-    WNS2 = 0x0F
-    SWNS = 0x10
-    TSET = 0x11
-    BAK  = 0x13
-    DELF = 0x14
-    AVAR = 0x15
-    GRP  = 0x17
-    DIR  = 0x19
-    OS   = 0x23
-    APP  = 0x24
-    IDL  = 0x26
-    CERT = 0x27
-    CLK  = 0x29
+    REAL,LIST,MATR,YVAR,STR ,PROG = (0x00,0x01,0x02,0x03,0x04,0x05)
+    PROT,PIC ,GDB ,WIN1,CPLX,CLST = (0x06,0x07,0x08,0x0B,0x0C,0x0D)
+    WNS2,SWNS,TSET,BAK ,DELF,AVAR = (0x0F,0x10,0x11,0x13,0x14,0x15)
+    GRP ,DIR ,OS  ,APP ,IDL ,CERT,CLK = (0x17,0x19,0x23,0x24,0x26,0x27,0x29)
     tostrdict = { 0x00 : "REAL",0x01 : "LIST",0x02 : "MATR",0x03 : "YVAR",0x04 : "STR ",0x05 : "PROG",0x06 : "PROT",0x07 : "PIC ",0x08 : "GDB ",0x0B : "WIN1",0x0C : "CPLX",0x0D : "CLST",0x0F : "WNS2",0x10 : "SWNS",0x11 : "TSET",0x13 : "BAK ",0x14 : "DELF",0x15 : "AVAR",0x17 : "GRP ",0x19 : "DIR ",0x23 : "OS  ",0x24 : "APP ",0x26 : "IDL ",0x27 : "CERT",0x29 : "CLK " }
     @classmethod
-    def tostring(cls,value):
-        if value in cls.tostrdict:
-            return cls.tostrdict[value]
-        else:
-            return "!"+hex(value)
+    def tostring(cls,t):    #Receives var type, returns in string if possible
+        return cls.tostrdict[t] if t in cls.tostrdict else "!{0}".format(hex(t))
 
 
 #Create header object which can return compact notation but also retains
 #easy-to-retrieve data such as types.
 #Alternative constructor format allows you to import packet data and
 #the class will init an instance with easy-to-retrieve data filled out
+#The Flash header format listed in the guide does not match what we have
+#here. That's because we're receiving directory listings with this class,
+#not forming packets with that data.
 class HEADER(object):
     def __init__(self, ftype_or_packetdata, fname = None, size = 0, isarc = 0, ver1 = 0, ver2 = 0):
         if fname is None:
-            self = self.__class__.fromheader(ftype_or_packetdata)
+            self.h = ftype_or_packetdata.data
+            h = self.h
+            self.size  = h[0]+h[1]*256
+            self.ftype = int(h[2])  #No matter the header style, type is always here.
+            self.fname = h[3:11].decode().strip('\x00')
+            if self.ftype > 0x22 and self.ftype < 0x28:
+                self.isarc = True
+                self.ver1  = 0
+                self.ver1  = 0
+            elif self.ftype == 0x13:
+                raise Exception("Reading backup header not supported")
+            else:
+                self.isarc = True if h[12] & 128 else False
+                self.ver1= h[11]
+                self.ver2= h[12] & 127
         else:
+            self.h = bytearray(13)
             self.ftype = ftype_or_packetdata
+            self.size  = size
             self.fname = fname
             self.isarc = True if isarc else False
             self.ver1  = ver1
             self.ver2  = ver2
             self.size  = size
+            if self.ftype > 0x22 and self.ftype < 0x28:
+                return self.toflashheader()
+            elif self.ftype == 0x13:
+                raise Exception("Creating backup header not supported")
+            else:
+                self.h[:2] = bytearray((self.size&255, (self.size>>8)&255 ))
+                self.h[2]  = self.ftype
+                self.h[3:len(self.fname)] = self.fname.encode('ascii')
+                self.h[11] = self.ver1
+                self.h[12] = (self.ver2&127) + (128 if self.isarc else 0)
+
 
     def toheader(self):
-        if self.ftype > 0x22 and self.ftype < 0x28:
-            raise Exception("Creating flash header not supported")
-        elif self.ftype == 0x13:
-            raise Exception("Creating backup header not supported")
-        else:
-            b = bytearray(13)
-            b[:2] = (self.size&255, (self.size>>8)&255 )
-            b[2]  = self.ftype
-            b[3:len(self.fname)] = self.fname.encode('ascii')
-            b[11] = self.ver1
-            b[12] = self.ver2&127 + (128 if self.isarc else 0)
-        return b
+        #Reinforce the name in case it gets overwritten in flash call
+        self.h[3:len(self.fname)] = self.fname.encode('ascii')
+        return self.h
 
-    #Alternate constructor that creates a HEADER object from the data
-    #of a VAR packet
-    @classmethod
-    def fromheader(cls,packet):
-        header = packet.data
-        t = header[2]
-        if t > 0x22 and t < 0x28:
-            raise Exception("Reading flash header not supported")
-        elif t == 0x13:
-            raise Exception("Reading backup header not supported")
+    #Exists for when you need to perform an actual flash transfer, which
+    #allows for modified packets involving page offsets and page numbers.
+    def toflashheader(self,pageoffset = None, pagenumber = None):
+        if pageoffset is not None and pagenumber is not None:
+            self.h[6] = pageoffset & 255
+            self.h[7] = pageoffset>>8 & 255
+            self.h[8] = pagenumber & 255
+            self.h[9] = pagenumber>>8 & 255
+            return memoryview(self.h)[:10]
         else:
-            s = header[0]+header[1]*256
-            n = header[3:11].decode().strip('\x00')
-            a = True if header[12] & 128 else False
-            v1= header[11]
-            v2= header[12] & 127
-            obj = cls.__new__(cls)
-            obj.__init__(t,n,s,a,v1,v2)
-            return obj
-        
+            self.h[3:len(self.fname)] = self.fname.encode('ascii')
+            return memoryview(self.h)[:11]
+
+
+
+
+
 
 ''' 
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
@@ -344,22 +316,6 @@ class TISERIAL(object):
         self.sm.active(1)
         return
 
-
-
-
-    def piobase(self):
-        return 0x50300000 if self.core else 0x50200000
-    #Returns address based on sm0 offset. Valid for CLKDIV to PINCTRL.
-    def smreg(self,sm0offset):
-        sm0offset -= 0x00C8 #SM0_CLKDIV
-        return (0x503000C8 if self.core else 0x502000C8) + 0x18*self.id + sm0offset
-    #Returns fifo address
-    def tx_fifo(self,value):
-        machine.mem32[(0x50300010 if self.core else 0x50200010) + 4 * self.id] = value
-    def rx_fifo(self):
-        return machine.mem32[(0x50300020 if self.core else 0x50200020) + 4 * self.id]
-
-
     def get(self,timeout_ms = -1):
         starttime = time.ticks_ms()
         #If in tx mode, set to rx mode and proceed to wait for incoming data
@@ -380,14 +336,21 @@ class TISERIAL(object):
                 #self.sm.restart()
                 return -1
             
+
+    def piobase(self):
+        return 0x50300000 if self.core else 0x50200000
+    #Returns address based on sm0 offset. Valid for CLKDIV to PINCTRL.
+    def smreg(self,sm0offset):
+        sm0offset -= 0x00C8 #SM0_CLKDIV
+        return (0x503000C8 if self.core else 0x502000C8) + 0x18*self.id + sm0offset
     ## REMOVE THE DEBUG FUNCTIONS WHEN DONE TESTING
     def dbg_printadr(self,ending='\n'):
+
         if ending=='\n':
             print("Stalled?  "+str(True if machine.mem32[self.smreg(SM0_EXECCTRL)]>>31&1 else False))
             print("SIDE_EN?  "+str(True if machine.mem32[self.smreg(SM0_EXECCTRL)]>>30&1 else False))
             print("S_PINDIR? "+str(True if machine.mem32[self.smreg(SM0_EXECCTRL)]>>29&1 else False))
-            print("")
-        print("Curinst: {i} @ adr {a}       ".format(i=decode_pio(machine.mem32[self.smreg(SM0_INSTR)],2,True),a=hex(machine.mem32[self.smreg(SM0_ADDR)])),end=ending)
+        print("Curinst:  {i} @ adr {a}       ".format(i=decode_pio(machine.mem32[self.smreg(SM0_INSTR)],2,True),a=hex(machine.mem32[self.smreg(SM0_ADDR)])),end=ending)
     def dbg(self):
         while True:
             self.dbg_printadr('\r')
@@ -401,33 +364,95 @@ class TISERIAL(object):
         
 
 class TIPROTO(TISERIAL):
+
     def __init__(self,*args,**kwargs):
         super(TIPROTO,self).__init__(*args,**kwargs)
-        self.machineid = 0x73
+        self.machineid = 0x12
+        self.ackpacket = PACKET(self.machineid,PV.ACK)
+        self.dirlist = list()
 
     def getpacket(self,start_timeout = 2000):
         mid = self.get(start_timeout)
-        cid = self.get(100)
-        lsb = self.get(100)
-        msb = self.get(100)
+        cid = self.get(start_timeout)
+        lsb = self.get(start_timeout)
+        msb = self.get(start_timeout)
         size = lsb+msb*256
         if size > 27000:
             raise Exception("Large data packets (>27000) not supported yet")
         if PACKET.gettype(cid) == 1:
-            return PACKET(mid, cid, bytearray((self.get(1000) for i in range(size))))
+            p = PACKET(mid, cid, bytearray((self.get(start_timeout) for i in range(size))))
+            lo,hi = (self.get(start_timeout) for i in range(2))
+            if (p.chksum_lsb,p.chksum_msb) != (lo,hi):
+                raise Exception("Checksum error on {0}".format(str(p)))
+            return p
         else:
             return PACKET(mid,cid)
 
     def sendpacket(self,packet):
+        self.sm.restart()
         start_timeout = 2000
         for i in packet.tobytesgen():
-            #print(i)
-            self.put(i,start_timeout)
+            v = self.put(i,start_timeout)
+            #print("Sending {0}, success? {1}".format(i, True if not v else False))
             start_timeout = 2000
 
     def sendack(self):
-        self.sendpacket(PACKET(self.machineid,PV.ACK))
+        self.sendpacket(self.ackpacket)
     
+    def getvarlist(self,filter = -1, depth = 0):
+        self.sm.restart()
+        #
+        # Variable request packets:
+        # PI -> 83 : REQ type DIR (other data in no-care state)
+        # PI <- 83 : ACK
+        # PI <- 83 : DATA [two bytes indicating amount of free RAM]
+        # PI -> 83 : ACK
+        # [...]
+        #
+        p = PACKET(self.machineid,PV.REQ,HEADER(VID.DIR,"").toheader())
+        print("Sending data: "+str(p))
+        self.sendpacket(p)
+        p = self.getpacket()
+        if p.cid != PV.ACK:
+            print(p)
+            raise Exception("No ACK on get directory request")
+        p = self.getpacket()
+        print("Free RAM reported: "+str(int(p.data[0])+int(p.data[1])*256))
+        print("Sending ackpacket: "+str(self.ackpacket))
+        self.sendack()
+        self.dirlist = []
+        #
+        # For each variable on the calculator:
+        # PI <- 83 : VAR (full variable data)
+        # PI -> 83 : ACK
+        #
+        # When there's no more left to get:
+        # PI <- 83 : EOT
+        # PI -> 83 : ACK
+        #
+        while p.cid != PV.EOT:
+            p = self.getpacket()
+            print("Received: "+str(p))
+            if p.cid == PV.VAR:
+                self.sendack()
+                h = HEADER(p)
+                if filter < 0 or h.ftype == filter:
+                    print("Found file: {n}, of type {t}".format(n = h.fname, t = VID.tostring(h.ftype)))
+                    self.dirlist.append(h)
+                continue
+            if p.cid != PV.EOT:
+                raise Exception("Unrecognized packet received. Aborting.")
+        self.sendack()
+        print("End of transmission. No more variables to receive.")
+
+                    
+
+
+
+
+
+
+
 
 
 
