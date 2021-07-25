@@ -193,7 +193,7 @@ class HEADER(object):
 
     def toheader(self):
         #Reinforce the name in case it gets overwritten in flash call
-        self.h[3:len(self.fname)] = self.fname.encode('ascii')
+        self.h[3:3+len(self.fname)] = self.fname.encode('ascii')
         return self.h
 
     #Exists for when you need to perform an actual flash transfer, which
@@ -206,12 +206,25 @@ class HEADER(object):
             self.h[9] = pagenumber>>8 & 255
             return memoryview(self.h)[:10]
         else:
-            self.h[3:len(self.fname)] = self.fname.encode('ascii')
+            self.h[3:3+len(self.fname)] = self.fname.encode('ascii')
             return memoryview(self.h)[:11]
 
+    def isflash(self):
+        if self.ftype > 0x22 and self.ftype < 0x28:
+            return True
+        else:
+            return False
+    def isbackup(self):
+        if self.ftype == 0x13:
+            return True
+        else:
+            return False
 
-
-
+    def __str__(self):
+        return "<{0} at {1}: file {2} of type {3}>".format(type(self).__name__, "?", self.fname, VID.tostring(self.ftype))
+    
+    def __repr__(self):
+        return self.__str__()
 
 
 ''' 
@@ -364,12 +377,16 @@ class TISERIAL(object):
         
 
 class TIPROTO(TISERIAL):
-
     def __init__(self,*args,**kwargs):
         super(TIPROTO,self).__init__(*args,**kwargs)
-        self.machineid = 0x12
+        if 'machineid' in kwargs:
+            self.machineid = kwargs['machineid']
+        else:
+            self.machineid = 0x73
         self.ackpacket = PACKET(self.machineid,PV.ACK)
         self.dirlist = list()
+        self.varhead = None
+        self.vardata = None
 
     def getpacket(self,start_timeout = 2000):
         mid = self.get(start_timeout)
@@ -388,8 +405,13 @@ class TIPROTO(TISERIAL):
         else:
             return PACKET(mid,cid)
 
-    def sendpacket(self,packet):
+    #Send either a PACKET type object, or a command (4byte) packet specified by cid
+    def sendpacket(self, packet, machineid = None):
         self.sm.restart()
+        if machineid is None:
+            machineid = self.machineid
+        if isinstance(packet,int):
+            packet = PACKET(machineid,packet)
         start_timeout = 2000
         for i in packet.tobytesgen():
             v = self.put(i,start_timeout)
@@ -414,7 +436,6 @@ class TIPROTO(TISERIAL):
         self.sendpacket(p)
         p = self.getpacket()
         if p.cid != PV.ACK:
-            print(p)
             raise Exception("No ACK on get directory request")
         p = self.getpacket()
         print("Free RAM reported: "+str(int(p.data[0])+int(p.data[1])*256))
@@ -445,16 +466,53 @@ class TIPROTO(TISERIAL):
         self.sendack()
         print("End of transmission. No more variables to receive.")
 
-                    
+    def findvar(self, name, ftype = -1):
+        for header in self.dirlist:
+            if header.fname == name:
+                if ftype < 0 or ftype == header.ftype:
+                    return header
+        return None
 
-
-
-
-
-
-
-
-
+    def getvar(self,header:HEADER):
+        self.sm.restart()
+        if header.isflash():
+            #
+            # Do flash receivey things
+            #
+            raise Exception("Flash receive not implemented yet.")
+            self.sendpacket(PACKET(self.machineid, PV.VAR, header.toflashheader()))
+        elif header.isbackup():
+            raise Exception("Backup receive not implemented. WONTFIX.")
+        else:
+            self.sendpacket(PACKET(self.machineid, PV.REQ, header.toheader()))
+            p = self.getpacket()    #Step 2
+            if p.cid == PV.SKIP:
+                self.sendack()
+                raise Exception("Oopsie poopsie. {0} not exist.".format(header))
+            if p.cid != PV.ACK:
+                raise Exception("Var request not acknowledged.")
+            p = self.getpacket()    #Step 3
+            if p.cid != PV.VAR:
+                raise Exception("Oopsie poopsie. Didn't actually get var data.")
+            header2 = HEADER(p)
+            if header.fname != header2.fname or header.ftype != header2.ftype:
+                self.sendpacket(PACKET(self.machineid, PV.SKIP, bytearray([1])))
+                self.getpacket()    #Should get an acknowledgement. Maybe.
+                raise Exception("Oopsie poopsie. We aren't receiving the expected variable.")
+            self.sendack()          #Step 4
+            time.sleep_ms(1)        #I think we need a delay?
+            self.sendpacket(PV.CTS) #Step 5
+            p = self.getpacket()    #Step 6
+            if p.cid != PV.ACK:
+                raise Exception("Oopsie poopsie. CTS not acknowledged.")
+            p = self.getpacket()    #Step 7. DATA get
+            if p.cid != PV.DATA:
+                raise Exception("Oopsie poopsie. Did not receive DATA packet.")
+            self.sendack()          #Step 8. Acknowledge data. We are done.
+            self.varhead = header
+            self.vardata = p.data
+            print("Variable {0} of type {1} received.".format(header.fname, VID.tostring(header.ftype)))
+            return 0
 
 t = TIPROTO()
     
