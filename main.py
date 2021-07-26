@@ -180,21 +180,24 @@ class HEADER(object):
             self.ver2  = ver2
             self.size  = size
             if self.ftype > 0x22 and self.ftype < 0x28:
-                return self.toflashheader()
+                self.toflashheader()
             elif self.ftype == 0x13:
                 raise Exception("Creating backup header not supported")
             else:
                 self.h[:2] = bytearray((self.size&255, (self.size>>8)&255 ))
                 self.h[2]  = self.ftype
-                self.h[3:len(self.fname)] = self.fname.encode('ascii')
+                self.h[3:3+len(self.fname)] = self.fname.encode('ascii')
                 self.h[11] = self.ver1
                 self.h[12] = (self.ver2&127) + (128 if self.isarc else 0)
+
+    def updatesize(self,newsize):
+        self.h[:2] = bytearray((newsize&255, newsize>>8&255))
 
 
     def toheader(self):
         #Reinforce the name in case it gets overwritten in flash call
         self.h[3:3+len(self.fname)] = self.fname.encode('ascii')
-        return self.h
+        return memoryview(self.h)[:13]
 
     #Exists for when you need to perform an actual flash transfer, which
     #allows for modified packets involving page offsets and page numbers.
@@ -391,8 +394,13 @@ class TIPROTO(TISERIAL):
     def getpacket(self,start_timeout = 2000):
         mid = self.get(start_timeout)
         cid = self.get(start_timeout)
+        time.sleep_ms(1)
         lsb = self.get(start_timeout)
         msb = self.get(start_timeout)
+        base = (mid,cid,lsb,msb)
+        if any((i == -1 for i in base)):
+            print("Packet incomplete. Got {0}".format(str(base)))
+            raise Exception("Incomplete packet received.")
         size = lsb+msb*256
         if size > 27000:
             raise Exception("Large data packets (>27000) not supported yet")
@@ -514,6 +522,56 @@ class TIPROTO(TISERIAL):
             print("Variable {0} of type {1} received.".format(header.fname, VID.tostring(header.ftype)))
             return 0
 
+    @classmethod
+    def fromfile(cls,filename):
+        with open(filename,"rb") as f:
+            f.read(8+3+42+2+2+2) #skip head,sig,comment,filedatsize,hlen,isize
+            ftype = f.read(1)[0]
+            fname = f.read(8).decode()
+            ver = f.read(1)[0]
+            ver2 = f.read(1)[0]
+            isarc = True if ver2 & 128 else False
+            ver2 &= 127
+            h = f.read(2)
+            size = h[0] + h[1] * 256
+            data = f.read(size)
+            return (HEADER(ftype,fname,size,isarc,ver, ver2), data)
+
+
+    def sendvar(self,header,data = None):
+        self.sm.restart()
+        if data is None:    #header is actually the name of a .8x file on the pi.
+            header,data = self.fromfile(header)
+        if header.isflash():
+            raise Exception("Cannot send flashapps and OS files yet.")
+        elif header.isbackup():
+            raise Exception("Sending backups not supported. WONTFIX.")
+        else:
+            self.sendpacket(PACKET(self.machineid, PV.RTS, header.toheader()))
+            p = self.getpacket()
+            print(p)
+            if p.cid != PV.ACK:
+                raise Exception("RTS not acknowledged. Exiting.")
+            time.sleep_ms(100)
+            p = self.getpacket()
+            print(p)
+            if p.cid == PV.SKIP:
+                raise Exception("Transmission canceled.")
+            elif p.cid != PV.CTS:
+                raise Exception("Wasn't cleared to send. Canceling.")
+            self.sendack()
+            time.sleep_ms(1)
+            self.sendpacket(PACKET(self.machineid, PV.DATA, data))
+            if self.getpacket().cid != PV.ACK:
+                raise Exception("Transmission of data not acknowledged.")
+            self.sendpacket(PV.EOT)
+
+
+
+
+
+
+
 t = TIPROTO()
     
 def emugraylink():
@@ -559,4 +617,4 @@ def help():
     print("t.dbg_printadr() : Prints the immediate address and if SM has stalled")
 help()
 
-
+test = lambda : t.sendvar("linktest.8xp")
