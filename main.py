@@ -296,7 +296,7 @@ class TISERIAL(object):
 
     statemachines = dict()  #Contains all initialized state machines
 
-    def __init__(self,statemachine = -1, basepin = -1):
+    def __init__(self,statemachine = -1, basepin = -1, *args, **kwargs):
         #
         # Check if we already instantiated this. If so, reuse, else init.
         #
@@ -572,7 +572,7 @@ class TIPROTO(TISERIAL):
 
 
 
-t = TIPROTO()
+t = TIPROTO(machineid = 0x23)
     
 def emugraylink():
     import micropython,select,sys
