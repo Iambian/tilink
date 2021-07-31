@@ -1,8 +1,8 @@
 
 import micropython
 micropython.alloc_emergency_exception_buf(200)
-from micropython import const
-import uctypes,rp2,time,machine,random,array,collections,sys,os
+from micropython import const, schedule
+import uctypes,rp2,time,machine,random,array,collections,sys,os, uio
 from machine import Pin
 from rp2 import PIO
 import builtins
@@ -12,13 +12,16 @@ PACKET_DEBUG = True
 
 
 def hex(value):
-    if type(value) is int:
-        return builtins.hex(value)
-    if type(value) is str and len(value)>0:
-        return str([builtins.hex(ord(i)) for i in value])
-    if iter(value) and len(value) > 0:
-        return str([builtins.hex(i) for i in value])
-    return str([])
+    try:
+        if type(value) is int:
+            return builtins.hex(value)
+        if type(value) is str and len(value)>0:
+            return str([builtins.hex(ord(i)) for i in value])
+        if iter(value) and len(value) > 0:
+            return str([builtins.hex(i) for i in value])
+        return str([])
+    except:
+        return "<NO REPR>"
 
 def decode_pio(uint16_val, sideset_bits = 0, sideset_opt = False):
     def di(fbv):    return str(fbv&7)+(" REL" if fbv&16 else "")
@@ -71,37 +74,35 @@ class PV(object):
     RTS = 0xC9
 
 class PACKET(PV):
-    data = {0x06:"VAR",0x15:"DATA",0x36:"SK/E",0x88:"DEL",0xA2:"S-REQ",0xC9:"RTS"}
+    wdat = {0x06:"VAR",0x15:"DATA",0x36:"SK/E",0x88:"DEL",0xA2:"S-REQ",0xC9:"RTS"}
     bare = {0x09:"CTS",0x2D:"VER",0x56:"ACK",0x5A:"ERR",0x68:"RDY",0x6D:"SCR",0x92:"EOT"}
-    def __init__(self,macid,cmdid,data=bytearray()):
+    def __init__(self,macid,cmdid,data=bytearray(),datasize = None):
         self.mid = macid
         self.cid = cmdid
         self.data = data
-        if data:
-            s,c = (len(data),sum(data))
+        if datasize:    #This is defined only if data is a stream/file-like object
+            s = datasize
         else:
-            s,c = (0,0)
+            if data:
+                s = len(data)
+            else:
+                s = 0
+        self.size = s
         self.size_lsb = s & 255
         self.size_msb = (s >> 8) & 255
-        self.chksum_lsb = c & 255
-        self.chksum_msb = (c >> 8) & 255
         self.name = self.getname(self.cid)
         self.base = bytearray([self.mid, self.cid, self.size_lsb, self.size_msb])
-
-    def tobytes(self):
-        if self.data:
-            return self.base + bytearray(self.data) + bytearray( [self.chksum_lsb, self.chksum_msb])
-        else:
-            return self.base
 
     def tobytesgen(self):
         for i in self.base:
             yield i
         if self.data:
-            for i in self.data:
+            chksum = 0
+            for _,i in zip(range(self.size),self.data):
+                chksum += i
                 yield i
-            yield self.chksum_lsb
-            yield self.chksum_msb
+            yield chksum & 255
+            yield (chksum >> 8) & 255
 
     @classmethod
     def getname(cls,cid):
@@ -109,7 +110,7 @@ class PACKET(PV):
         if packettype < 0:
             return "UNK ({:02X})".format(packettype)
         elif packettype:
-            return cls.data[cid]
+            return cls.wdat[cid]
         else:
             return cls.bare[cid]
 
@@ -118,7 +119,7 @@ class PACKET(PV):
     def gettype(cls,cid):
         if cid in cls.bare:
             return 0
-        elif cid in cls.data:
+        elif cid in cls.wdat:
             return 1
         else:
             return -1
@@ -130,9 +131,7 @@ class PACKET(PV):
         pass
 
     def __str__(self):
-        return "<{0} type {1} data {2} from machine {4} chksum {3}>".format(type(self).__name__, self.getname(self.cid), hex(self.data), hex((self.chksum_lsb, self.chksum_msb)), hex(self.mid))
-
-    
+        return "<{0} type {1} data {2} from machine {3}>".format(type(self).__name__, self.getname(self.cid), hex(self.data), hex(self.mid))
 
 class VID(object):
     REAL,LIST,MATR,YVAR,STR ,PROG = (0x00,0x01,0x02,0x03,0x04,0x05)
@@ -229,6 +228,62 @@ class HEADER(object):
     def __repr__(self):
         return self.__str__()
 
+class MEMFILE(object):
+    #Conveinence class. Should use only for SMALL (<256bytes) OBJECTS
+    #obj must be of types bytearray() or memoryview()
+    def __init__(self,obj): #obj must support getitem
+        self.o,self.p,self.l = (obj,0,len(obj))
+    def read(self,s=-1):
+        p=self.p
+        self.p=self.l-1 if s is None or s<0 else p+s
+        return memoryview(self.o)[p:(None if s<0 else s)]
+    def readinto(self,b):
+        b[:] = read(len(b))
+        return len(b)
+    def seek(self,o,w):
+        self.p = (w+self.p if o<2 else self.l-1+w) if o else w
+        return self.p
+    def tell(self):
+        return self.p
+    def write(self,d):
+        self.o[self.p:self.p+len(d)] = d[:]
+        return len(d)
+
+class INTELLEC(object):
+    DATA    = 0x00
+    EOF     = 0x01
+    ESA     = 0x02
+    rectype = {DATA:"DATA",EOF:"EOF",ESA:"PAGE"}
+    txt2num = {0x30:0,0x31:1,0x32:2,0x33:3,0x34:4,0x35:5,0x36:6,0x37:7,0x38:8,0x39:9,0x41:10,0x42:11,0x43:12,0x44:13,0x45:14,0x46:15}
+
+    def texttobyte(self):
+        a = self.txt2num[self.f.__next__()]
+        return self.txt2num[self.f.__next__()]+a*16
+
+    def __init__(self,f=None):
+        self.f = f
+        self.type = -1
+        if f is None:   #If no input, returns an object init'd to type -1
+            return      #This was added for loop control purposes
+        try:
+            while True:
+                i = f.__next__()
+                if i == ':':
+                    break
+            self.size   = self.texttobyte()
+            self.addrHI = self.texttobyte()
+            self.addrLO = self.texttobyte()
+            self.addr   = self.addrHI*256+self.addrLO
+            self.type   = self.texttobyte()
+            self.data   = bytearray(self.size)
+            for i in range(self.size):
+                self.data[i] = self.texttobyte()
+            self.chks = 255 & (-(self.size + self.addrHI + self.addrLO + self.type + sum(self.data)))
+        except StopIteration:
+            pass
+        return
+
+                
 
 ''' 
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
@@ -380,16 +435,19 @@ class TISERIAL(object):
         
 
 class TIPROTO(TISERIAL):
+
     def __init__(self,*args,**kwargs):
         super(TIPROTO,self).__init__(*args,**kwargs)
         if 'machineid' in kwargs:
             self.machineid = kwargs['machineid']
         else:
-            self.machineid = 0x73
+            self.machineid = 0x23
         self.ackpacket = PACKET(self.machineid,PV.ACK)
         self.dirlist = list()
         self.varhead = None
         self.vardata = None
+        # Used to return header in fromfile() because it is (now) a generator
+        self.curheader = HEADER(0,'')
 
     def getpacket(self,start_timeout = 2000):
         mid = self.get(start_timeout)
@@ -405,13 +463,19 @@ class TIPROTO(TISERIAL):
         if size > 27000:
             raise Exception("Large data packets (>27000) not supported yet")
         if PACKET.gettype(cid) == 1:
-            p = PACKET(mid, cid, bytearray((self.get(start_timeout) for i in range(size))))
+            data = bytearray((self.get(start_timeout) for i in range(size)))
+            p = PACKET(mid, cid, data)
             lo,hi = (self.get(start_timeout) for i in range(2))
-            if (p.chksum_lsb,p.chksum_msb) != (lo,hi):
+            if sum(data) != lo+hi*256:
                 raise Exception("Checksum error on {0}".format(str(p)))
+            if PACKET_DEBUG:
+                print("Packet received: {0}".format(p))
             return p
         else:
-            return PACKET(mid,cid)
+            p = PACKET(mid,cid)
+            if PACKET_DEBUG:
+                print("Packet received: {0}".format(p))
+            return p
 
     #Send either a PACKET type object, or a command (4byte) packet specified by cid
     def sendpacket(self, packet, machineid = None):
@@ -420,10 +484,13 @@ class TIPROTO(TISERIAL):
             machineid = self.machineid
         if isinstance(packet,int):
             packet = PACKET(machineid,packet)
+        #if PACKET_DEBUG:
+        #    print("Sending: "+str(packet))
         start_timeout = 2000
         for i in packet.tobytesgen():
             v = self.put(i,start_timeout)
-            #print("Sending {0}, success? {1}".format(i, True if not v else False))
+            if PACKET_DEBUG:
+                print("Sending {0} {2} {3}, success? {1}".format(i, True if not v else False,hex(i),chr(i) if i >=0x20 else "??"))
             start_timeout = 2000
 
     def sendack(self):
@@ -431,37 +498,20 @@ class TIPROTO(TISERIAL):
     
     def getvarlist(self,filter = -1, depth = 0):
         self.sm.restart()
-        #
-        # Variable request packets:
-        # PI -> 83 : REQ type DIR (other data in no-care state)
-        # PI <- 83 : ACK
-        # PI <- 83 : DATA [two bytes indicating amount of free RAM]
-        # PI -> 83 : ACK
-        # [...]
-        #
         p = PACKET(self.machineid,PV.REQ,HEADER(VID.DIR,"").toheader())
-        print("Sending data: "+str(p))
+        #print("Sending data: "+str(p))
         self.sendpacket(p)
         p = self.getpacket()
         if p.cid != PV.ACK:
             raise Exception("No ACK on get directory request")
         p = self.getpacket()
-        print("Free RAM reported: "+str(int(p.data[0])+int(p.data[1])*256))
-        print("Sending ackpacket: "+str(self.ackpacket))
+        #print("Free RAM reported: "+str(int(p.data[0])+int(p.data[1])*256))
+        #print("Sending ackpacket: "+str(self.ackpacket))
         self.sendack()
         self.dirlist = []
-        #
-        # For each variable on the calculator:
-        # PI <- 83 : VAR (full variable data)
-        # PI -> 83 : ACK
-        #
-        # When there's no more left to get:
-        # PI <- 83 : EOT
-        # PI -> 83 : ACK
-        #
         while p.cid != PV.EOT:
             p = self.getpacket()
-            print("Received: "+str(p))
+            #print("Received: "+str(p))
             if p.cid == PV.VAR:
                 self.sendack()
                 h = HEADER(p)
@@ -484,11 +534,33 @@ class TIPROTO(TISERIAL):
     def getvar(self,header:HEADER):
         self.sm.restart()
         if header.isflash():
-            #
-            # Do flash receivey things
-            #
-            raise Exception("Flash receive not implemented yet.")
-            self.sendpacket(PACKET(self.machineid, PV.VAR, header.toflashheader()))
+            self.sendpacket(PACKET(self.machineid, PV.REQ, header.toflashheader()))
+            time.sleep_ms(1)
+            p = self.getpacket()
+            if p.cid != PV.ACK:
+                raise Exception("RTS not acknowledged. Got {0} instead.".format(str(p)))
+            while True:
+                p = self.getpacket()    #Getting a flash-style header here
+                if p.cid == PV.EOT:
+                    time.sleep_ms(1)
+                    self.sendack()
+                    print("End of transfer packet received.")
+                    return 0
+                if p.cid != PV.VAR:
+                    raise Exception("Expected VAR reply. Got {0} instead.".format(str(p)))
+                blksize = p.data[0]+p.data[1]*256
+                pg_ofst = p.data[6]+p.data[7]*256
+                pg_nmbr = p.data[8]+p.data[9]*256
+                self.sendack()
+                time.sleep_ms(1)
+                self.sendpacket(PV.CTS)
+                if self.getpacket().cid != PV.ACK:
+                    raise Exception("CTS not acknowledged. Exiting.")
+                p = self.getpacket()
+                self.sendack()
+                if p.cid != PV.DATA:
+                    raise Exception("Expected DATA packet. Got {0} instead.".format(str(p)))
+                print("Received app data size {0} offset {1} page {2}".format(hex(blksize),hex(pg_ofst), hex(pg_nmbr)))
         elif header.isbackup():
             raise Exception("Backup receive not implemented. WONTFIX.")
         else:
@@ -522,27 +594,88 @@ class TIPROTO(TISERIAL):
             print("Variable {0} of type {1} received.".format(header.fname, VID.tostring(header.ftype)))
             return 0
 
-    @classmethod
-    def fromfile(cls,filename):
+    #Changing this to a generator that yields a file object
+    #Initializing requires a dummy read
+    def fromfile(self,filename):
         with open(filename,"rb") as f:
-            f.read(8+3+42+2+2+2) #skip head,sig,comment,filedatsize,hlen,isize
-            ftype = f.read(1)[0]
-            fname = f.read(8).decode()
-            ver = f.read(1)[0]
-            ver2 = f.read(1)[0]
-            isarc = True if ver2 & 128 else False
-            ver2 &= 127
-            h = f.read(2)
-            size = h[0] + h[1] * 256
-            data = f.read(size)
-            return (HEADER(ftype,fname,size,isarc,ver, ver2), data)
+            ext = filename[-3:]
+            print("File {0} opened.".format(filename))
+            if ext == "8xk":
+                if f.read(8).decode() != "**TIFL**":
+                    raise Exception("Flash header incorrect (first 8 bytes)")
+                revision    = f.read(2) #BCD coded: major.minor
+                flags       = f.read(1) #Usually 0x00
+                objtype     = f.read(1) #Usually 0x00
+                date        = f.read(4) #BCD coded e.g. dd,mm,yy,yy (dd/mm/yyyy)
+                namelen     = f.read(1) #Name length. Not exactly needed...
+                fname       = f.read(8).decode().split('\0')[0]
+                f.read(23)              #Filler. Unused.
+                devicetype  = f.read(1)[0] #TI73:74h, 83p:73h, 89:98h, 92p:88h
+                ftype       = f.read(1)[0]
+                f.read(24)              #Filler. Unused
+                # The documentation states that the following 4 bytes of size
+                # indicates the number of intelhex characters in the file. The
+                # app that I checked indicates that in pure size. For apps, this
+                # value is probably ignorable as you'd parse each line
+                # (yes, the data is in text mode. Windows-style in my case)
+                fsize       = f.read(4) #Yesh.
+                #Size of the file not known at this time since it will be sent
+                #in blocks as defined in the file thinger.
+                self.curheader = HEADER(ftype,fname,0,1,0,0)
+                yield 0 #Dummy read to initialize things
+                for i in f.read():
+                    yield i
+            elif ext in ('8xp','8xv'):
+                f.read(8+3+42+2+2+2) #skip head,sig,comment,filedatsize,hlen,isize
+                ftype = f.read(1)[0]
+                fname = f.read(8).decode().split('\0')[0]
+                ver = f.read(1)[0]
+                ver2 = f.read(1)[0]
+                isarc = True if ver2 & 128 else False
+                ver2 &= 127
+                h = f.read(2)
+                size = h[0] + h[1] * 256
+                #data = f.read(size)
+                self.curheader = HEADER(ftype,fname,size,isarc,ver, ver2)
+                print("CONSTR HDR: "+str(self.curheader))
+                yield 0 #Dummy read to initialize things
+                for i in f.read():
+                    yield i
+            else:
+                raise Exception("Unknown file type .{0}".format(ext))
 
+    def sendvarsub(self):
+        pass
 
     def sendvar(self,header,data = None):
         self.sm.restart()
         if data is None:    #header is actually the name of a .8x file on the pi.
-            header,data = self.fromfile(header)
+            data = self.fromfile(header)
+            data.__next__() #prime the sender so self.curheader gets init'd
+            header = self.curheader
+            print(header)
         if header.isflash():
+
+            self.sendpacket(PACKET(self.machineid, PV.VAR, header.toflashheader()))
+            if self.getpacket().cid != PV.ACK:
+                raise Exception("App send req not acknowledged")
+            if self.getpacket().cid != PV.CTS:
+                raise Exception("App not cleared to send.")
+            self.sendack()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
             raise Exception("Cannot send flashapps and OS files yet.")
         elif header.isbackup():
             raise Exception("Sending backups not supported. WONTFIX.")
@@ -561,7 +694,7 @@ class TIPROTO(TISERIAL):
                 raise Exception("Wasn't cleared to send. Canceling.")
             self.sendack()
             time.sleep_ms(1)
-            self.sendpacket(PACKET(self.machineid, PV.DATA, data))
+            self.sendpacket(PACKET(self.machineid, PV.DATA, data, header.size))
             if self.getpacket().cid != PV.ACK:
                 raise Exception("Transmission of data not acknowledged.")
             self.sendpacket(PV.EOT)
@@ -572,23 +705,71 @@ class TIPROTO(TISERIAL):
 
 
 
+EMBUF = MEMFILE(bytearray(1000))
 t = TIPROTO(machineid = 0x23)
-    
-def emugraylink():
-    import micropython,select,sys
-    global t
-    #print("Begin graylink emulation. REPL being disabled.")
-    micropython.kbd_intr(-1)     #Allows stdin/out to be used as terminal
+pin2 = Pin(2,Pin.IN,Pin.PULL_UP)
+def tlp():
     while True:
-        while sys.stdin in select.select([sys.stdin], [],[],0)[0]:
-            c = sys.stdin.buffer.read(1)
-            if len(c) == 1:
-                #print(c[0])
-                t.put(c[0],50)
-        else:
-            c = t.get()
-            if c > -1:
-                sys.stdout.buffer.write(bytes([c]))
+        print(pin2.value())
+        time.sleep_ms(100)
+    
+def emu(logging = False):
+    import micropython,select,sys
+    global t,EMBUF
+    f = None
+    iodir = 1   #1=put, 0=get
+    data = list()
+    sensepin = Pin(2,Pin.IN,Pin.PULL_UP)
+    logbuf = bytearray(32768)
+    logptr = 0
+    def flush(fobj,data,iodir):
+        s = "TO83: " if iodir else "FR83: " + ''.join(['{0:02X}'.format(i) for i in data]) + "\n\r"
+        for i in s:
+            if fobj[1] > 32760:
+                break
+            fobj[0][fobj[1]] = ord(i)
+            fobj[1] += 1
+        data.clear()
+        return fobj[1]
+
+    micropython.kbd_intr(-1)     #Allows stdin/out to be used as terminal
+    try:
+        while True:
+            if not sensepin.value():
+                micropython.kbd_intr(3)
+                if logging:
+                    f = open("logger.txt","wb")
+                    f.write(logbuf)
+                    f.close()
+                return
+            while sys.stdin in select.select([sys.stdin], [],[],0)[0]:
+                c = sys.stdin.buffer.read(1)[0]
+                t.put(c,2000)
+                if logging:
+                    if iodir != 1:
+                        logptr = flush([logbuf,logptr],data,iodir)
+                        iodir = 1
+                    data.append(c)
+            else:
+                c = t.get()
+                if c > -1:
+                    if logging:
+                        if iodir != 0:
+                            logptr = flush([logbuf,logptr],data,iodir)
+                            iodir = 0
+                        data.append(c)
+                    sys.stdout.buffer.write(bytes([c]))
+    except Exception as e:
+        if logging:
+            try:
+                f = open("logger.txt","wb")
+                f.write(logbuf)
+                sys.print_exception(e, file=f)
+            except:
+                sys.print_exception(e,EMBUF)
+                f.close()
+                return "ERROR"
+            f.close()
 
 def tightloop():
     a = []
@@ -596,7 +777,9 @@ def tightloop():
         t.put(i,50)
         a.append(t.get())
     print(a)
-
+def pkdb(val):
+    global PACKET_DEBUG
+    PACKET_DEBUG = val
 
 def help():
     print("Helpful notes:")
@@ -610,11 +793,13 @@ def help():
     print("* TODO: Add functions to TIPROTO to perform actual actions (e.g. get var, get var list, send vars)")
     print("* Available functions and shorthand mappings")
     print("  t = TIPROTO() : Init and autoassigns to first mapping (0)")
-    print("  emugraylink() -- Begin graylink emulator. [THIS DISABLES THE REPL. DISCONNECT FROM VSCODE AFTER USING]")
+    print("  emu() -- Begin graylink emulator. [THIS DISABLES THE REPL. DISCONNECT FROM VSCODE AFTER USING]")
     print("* TODO: Fix emugraylink() to use new TISERIAL class")
     print("Debugging calls: ")
     print("t.dbg() : Infinite loop displaying current PIO instruction")
     print("t.dbg_printadr() : Prints the immediate address and if SM has stalled")
+    print("pkdb(true/false) : Turns on or off packet debugging")
 help()
 
 test = lambda : t.sendvar("linktest.8xp")
+pkdb(0)
