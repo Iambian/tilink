@@ -1,7 +1,0 @@
-This project really should be in C since that's how I'm supposed to
-implement the USB drivers needed to meet the end goal of presenting
-a TI calculator to a computer as an MTP device for ease of variable
-transfer.
-
-At the moment, testing will be done in Python since that permits
-faster turnaround during testing. Gotta make sure the basics work.
