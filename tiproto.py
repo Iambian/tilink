@@ -235,18 +235,21 @@ class MEMFILE(object):
         self.o,self.p,self.l = (obj,0,len(obj))
     def read(self,s=-1):
         p=self.p
-        self.p=self.l-1 if s is None or s<0 else p+s
-        return memoryview(self.o)[p:(None if s<0 else s)]
+        self.p=self.l-1 if (s is None or s<0) else p+s
+        return memoryview(self.o)[p:p+(self.l if s<0 else s)]
     def readinto(self,b):
-        b[:] = read(len(b))
+        b[:] = self.read(len(b))
         return len(b)
-    def seek(self,o,w):
+    def seek(self,o=0,w=0):
         self.p = (w+self.p if o<2 else self.l-1+w) if o else w
         return self.p
     def tell(self):
         return self.p
     def write(self,d):
+        if len(d)+self.p>=self.l:
+            return 0
         self.o[self.p:self.p+len(d)] = d[:]
+        self.p += len(d)
         return len(d)
 
 class INTELLEC(object):
@@ -706,48 +709,45 @@ class TIPROTO(TISERIAL):
 
 
 EMBUF = MEMFILE(bytearray(1000))
-t = TIPROTO(machineid = 0x23)
-pin2 = Pin(2,Pin.IN,Pin.PULL_UP)
-def tlp():
-    while True:
-        print(pin2.value())
-        time.sleep_ms(100)
+t = TIPROTO(basepin = 2, machineid = 0x23)
+
+def dump(f):
+    chunksize = 16000
+    p = int(f.l / chunksize)
+    f.seek()
+    for i in range(p):
+        with open("logf{:02}.txt".format(i),"wb") as fo:
+            fo.write(f.read(chunksize))
     
 def emu(logging = False):
     import micropython,select,sys
     global t,EMBUF
-    f = None
-    iodir = 1   #1=put, 0=get
     data = list()
-    sensepin = Pin(2,Pin.IN,Pin.PULL_UP)
-    logbuf = bytearray(32768)
-    logptr = 0
+    iodir = 1   #1=put, 0=get
+    sensepin = Pin(0,Pin.IN,Pin.PULL_UP)
+    f = MEMFILE(bytearray(50000))
+
     def flush(fobj,data,iodir):
-        s = "TO83: " if iodir else "FR83: " + ''.join(['{0:02X}'.format(i) for i in data]) + "\n\r"
-        for i in s:
-            if fobj[1] > 32760:
-                break
-            fobj[0][fobj[1]] = ord(i)
-            fobj[1] += 1
+        s = ("TO83: " if iodir else "FR83: " + ''.join(['{0:02X}'.format(i) for i in data]) + "\n").encode()
+        fobj.write(s)
         data.clear()
-        return fobj[1]
+        return
 
     micropython.kbd_intr(-1)     #Allows stdin/out to be used as terminal
+
     try:
         while True:
             if not sensepin.value():
                 micropython.kbd_intr(3)
                 if logging:
-                    f = open("logger.txt","wb")
-                    f.write(logbuf)
-                    f.close()
+                    dump(f)
                 return
             while sys.stdin in select.select([sys.stdin], [],[],0)[0]:
                 c = sys.stdin.buffer.read(1)[0]
                 t.put(c,2000)
                 if logging:
                     if iodir != 1:
-                        logptr = flush([logbuf,logptr],data,iodir)
+                        flush(f,data,iodir)
                         iodir = 1
                     data.append(c)
             else:
@@ -755,21 +755,19 @@ def emu(logging = False):
                 if c > -1:
                     if logging:
                         if iodir != 0:
-                            logptr = flush([logbuf,logptr],data,iodir)
+                            flush(f,data,iodir)
                             iodir = 0
                         data.append(c)
                     sys.stdout.buffer.write(bytes([c]))
     except Exception as e:
         if logging:
             try:
-                f = open("logger.txt","wb")
-                f.write(logbuf)
+                dump(f)
                 sys.print_exception(e, file=f)
             except:
-                sys.print_exception(e,EMBUF)
-                f.close()
+                with open("EMERGENCY.txt","wt") as em:
+                    sys.print_exception(e,em)
                 return "ERROR"
-            f.close()
 
 def tightloop():
     a = []

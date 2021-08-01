@@ -71,8 +71,8 @@ this by flashing a Micropython image to it. Google "raspberry pi pico how to upd
 That extension adds stuff to the bottom bar while you have some Python files open
 and your RP2 connected to your computer. It lets you send and run stuff on the RP2.
 
-6. Open main.py, wait for VSCode to configure itself, then on the bottom bar,
-click "Run" to run the code. **DO NOT CLICK "Upload" OR YOU'LL HAVE A BAD TIME**.
+6. Open tiproto.py, wait for VSCode to configure itself, then on the bottom bar,
+click "Run" to run the code.
 All the action will now be in the Terminal (by default, the bottom window pane),
 and some documentation about the program/module should print. This is your cue
 to have fun and break everything.
