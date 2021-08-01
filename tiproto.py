@@ -749,7 +749,7 @@ def emu(logging = False):
                     if iodir != 1:
                         flush(f,data,iodir)
                         iodir = 1
-                    data.append(c)
+                    data.append(c) #TODO: CHANGE DATA OVER TO FILE OBJ OF MAX 27KB
             else:
                 c = t.get()
                 if c > -1:
@@ -764,9 +764,11 @@ def emu(logging = False):
             try:
                 dump(f)
                 sys.print_exception(e, file=f)
+                micropython.kbd_intr(3)
             except:
                 with open("EMERGENCY.txt","wt") as em:
                     sys.print_exception(e,em)
+                micropython.kbd_intr(3)
                 return "ERROR"
 
 def tightloop():
@@ -799,5 +801,26 @@ def help():
     print("pkdb(true/false) : Turns on or off packet debugging")
 help()
 
+def showemergency():
+    print("\nShowing contents of EMERGENCY.txt: \n\n")
+    with open("EMERGENCY.txt","rt") as f:
+        for line in f:
+            print(line.strip())
+
+def log(v=None):
+    try:
+        if v is None:
+            r = 999
+            v = 0
+        else:
+            r = v+1
+        for i in range(v,r):
+            print("Opening: logf{:02}.txt".format(i))
+            with open("logf{:02}.txt".format(i),"rt") as fo:
+                for line in fo:
+                    print(line.strip())
+        return
+    except:
+        return
 test = lambda : t.sendvar("linktest.8xp")
 pkdb(0)
