@@ -231,11 +231,13 @@ class HEADER(object):
 class MEMFILE(object):
     #Conveinence class. Should use only for SMALL (<256bytes) OBJECTS
     #obj must be of types bytearray() or memoryview()
-    def __init__(self,obj): #obj must support getitem
-        self.o,self.p,self.l = (obj,0,len(obj))
+    #skip arg is used to exclude leading writes in case of writing to
+    #logs where some initial bytes needs to be ignored.
+    def __init__(self,obj,skip=0): #obj must support getitem
+        self.o,self.p,self.l,self.s = (obj,0,len(obj),skip)
     def read(self,s=-1):
         p=self.p
-        self.p=self.l-1 if (s is None or s<0) else p+s
+        self.p=self.l if (s is None or s<0) else p+s
         return memoryview(self.o)[p:p+(self.l if s<0 else s)]
     def readinto(self,b):
         b[:] = self.read(len(b))
@@ -246,11 +248,15 @@ class MEMFILE(object):
     def tell(self):
         return self.p
     def write(self,d):
-        if len(d)+self.p>=self.l:
+        ld=len(d)
+        if ld+self.p>=self.l:
             return 0
-        self.o[self.p:self.p+len(d)] = d[:]
-        self.p += len(d)
-        return len(d)
+        if self.s>ld:
+            self.s-=ld
+            return 0
+        self.o[self.p:self.p+ld] = d[:]
+        self.p += ld
+        return ld
 
 class INTELLEC(object):
     DATA    = 0x00
@@ -713,25 +719,28 @@ t = TIPROTO(basepin = 2, machineid = 0x23)
 
 def dump(f):
     chunksize = 16000
-    p = int(f.l / chunksize)
+    p = int(f.p / chunksize) + ((f.p % chunksize) != 0)
     f.seek()
     for i in range(p):
         with open("logf{:02}.txt".format(i),"wb") as fo:
             fo.write(f.read(chunksize))
+
+def flush(fobj,data,iodir):
+    p = data.p
+    data.seek(0)
+    fobj.write(bytearray("\nTO83: " if iodir else "\nFR83: "))
+    for i in data.read(p):
+        fobj.write(bytearray('{0:02X}'.format(i)))
+    data.seek(0)
+    return
     
 def emu(logging = False):
-    import micropython,select,sys
+    import select
     global t,EMBUF
-    data = list()
+    data = MEMFILE(bytearray(25000))
+    f = MEMFILE(bytearray(50000),20000)
     iodir = 1   #1=put, 0=get
     sensepin = Pin(0,Pin.IN,Pin.PULL_UP)
-    f = MEMFILE(bytearray(50000))
-
-    def flush(fobj,data,iodir):
-        s = ("TO83: " if iodir else "FR83: " + ''.join(['{0:02X}'.format(i) for i in data]) + "\n").encode()
-        fobj.write(s)
-        data.clear()
-        return
 
     micropython.kbd_intr(-1)     #Allows stdin/out to be used as terminal
 
@@ -749,7 +758,7 @@ def emu(logging = False):
                     if iodir != 1:
                         flush(f,data,iodir)
                         iodir = 1
-                    data.append(c) #TODO: CHANGE DATA OVER TO FILE OBJ OF MAX 27KB
+                    data.write(bytearray([c]))
             else:
                 c = t.get()
                 if c > -1:
@@ -757,7 +766,7 @@ def emu(logging = False):
                         if iodir != 0:
                             flush(f,data,iodir)
                             iodir = 0
-                        data.append(c)
+                        data.write(bytearray([c]))
                     sys.stdout.buffer.write(bytes([c]))
     except Exception as e:
         if logging:
