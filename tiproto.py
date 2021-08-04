@@ -202,6 +202,10 @@ class HEADER(object):
     #allows for modified packets involving page offsets and page numbers.
     def toflashheader(self,pageoffset = None, pagenumber = None):
         if pageoffset is not None and pagenumber is not None:
+            self.h[2] = self.ftype
+            self.h[4] = 0
+            self.h[3] = 0
+            self.h[5] = 0
             self.h[6] = pageoffset & 255
             self.h[7] = pageoffset>>8 & 255
             self.h[8] = pagenumber & 255
@@ -262,7 +266,7 @@ class INTELLEC(object):
     DATA    = 0x00
     EOF     = 0x01
     ESA     = 0x02
-    rectype = {DATA:"DATA",EOF:"EOF",ESA:"PAGE"}
+    rectype = {-1:"NONE",DATA:"DATA",EOF:"EOF",ESA:"PAGE"}
     txt2num = {0x30:0,0x31:1,0x32:2,0x33:3,0x34:4,0x35:5,0x36:6,0x37:7,0x38:8,0x39:9,0x41:10,0x42:11,0x43:12,0x44:13,0x45:14,0x46:15}
 
     def texttobyte(self):
@@ -276,8 +280,7 @@ class INTELLEC(object):
             return      #This was added for loop control purposes
         try:
             while True:
-                i = f.__next__()
-                if i == ':':
+                if f.__next__() == ord(':'):
                     break
             self.size   = self.texttobyte()
             self.addrHI = self.texttobyte()
@@ -287,10 +290,20 @@ class INTELLEC(object):
             self.data   = bytearray(self.size)
             for i in range(self.size):
                 self.data[i] = self.texttobyte()
-            self.chks = 255 & (-(self.size + self.addrHI + self.addrLO + self.type + sum(self.data)))
+            self.chks   = 255 & (-(self.size + self.addrHI + self.addrLO + self.type + sum(self.data)))
+            self.chksm  = self.texttobyte()
+            if self.chks != self.chksm:
+                self.type = -1
+                raise Exception("Data section checksum does not match expected values")
         except StopIteration:
+            print("EOF on INTELLEC read encountered.")
             pass
         return
+    def __str__(self):
+        return "<{0} at {1}: record type {2}>".format(type(self).__name__, "?", self.rectype(self.type))
+    
+    def __repr__(self):
+        return self.__str__()
 
                 
 
@@ -658,34 +671,89 @@ class TIPROTO(TISERIAL):
 
     def sendvar(self,header,data = None):
         self.sm.restart()
+        starttime = time.ticks_ms()
         if data is None:    #header is actually the name of a .8x file on the pi.
             data = self.fromfile(header)
             data.__next__() #prime the sender so self.curheader gets init'd
             header = self.curheader
             print(header)
         if header.isflash():
-
-            self.sendpacket(PACKET(self.machineid, PV.VAR, header.toflashheader()))
+            def flushchunk(chunkdata,header,page,address):
+                pass
+                h = header.toflashheader(address,page)
+                self.sendpacket(PACKET(self.machineid, PV.VAR, h))
+                if self.getpacket().cid != PV.ACK:
+                    raise Exception("VAR req to send not acknowledged.")
+                if self.getpacket().cid != PV.CTS:
+                    raise Exception("VAR not cleared to send.")
+                
+                self.sendack()
+                time.sleep_us(250)
+                self.sendpacket(PACKET(self.machineid,PV.DATA,chunkdata))
+                p = self.getpacket()
+                if p.cid == PV.ERR:
+                    raise Exception("Error occurred on data xmit page {0}, address {1}".format(page,address))
+                if p.cid != PV.ACK:
+                    raise Exception("Data packet not acknowleged.")
+                print("Chunk @ {0:04X} page {1:02X}  flushed to i/o".format(address,page))
+                pass
+            if header.ftype != 0x24:
+                raise Exception("Cannot handle non-app Flash types")
+            print("File header: "+str(header))
+            #Verify that the calc is ready to receive before trying
+            
+            self.sendpacket(PV.RDY)
             if self.getpacket().cid != PV.ACK:
-                raise Exception("App send req not acknowledged")
-            if self.getpacket().cid != PV.CTS:
-                raise Exception("App not cleared to send.")
-            self.sendack()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-            raise Exception("Cannot send flashapps and OS files yet.")
+                raise Exception("Receiver not ready")
+            
+            basepage = -1
+            address = -1
+            chunks = 0
+            appdata = bytearray(0x80)
+            header.updatesize(0x80) #block size
+            while True:
+                idata = INTELLEC(data)  #Read next data section
+                if idata.type == -1:
+                    print("Error or early EOF")
+                    print("Exiting conds: pg {0}, adr {1}, chnk {2}, data {3}".format(basepage,address,chunks,appdata))
+                    break
+                elif idata.type == INTELLEC.ESA:
+                    if chunks > 0:  #in case someone decides to leave out some data
+                        flushchunk(appdata,header,basepage,address&0x7F80)
+                        chunks = 0
+                        appdata = bytearray(0x80)   #make a new one.
+                        gc.collect()    #Do GC things while the calc is processing
+                    basepage = idata.data[0]*256+idata.data[1]
+                    address = -1
+                    print("Basepage set to {0:02X}".format(basepage))
+                    continue
+                elif idata.type == INTELLEC.EOF:
+                    print("EOF record retrieved.")
+                    if chunks > 0:  #in case someone decides to leave out some data
+                        flushchunk(appdata,header,basepage,address&0x7F80)
+                    break
+                elif idata.type == INTELLEC.DATA:
+                    if address < 0 :
+                        address = idata.addr
+                    elif idata.addr-address != 0x20:
+                        raise Exception("App data blocks must be contiguous. Found {0:04X}, expected {1:04X}".format(idata.addr,address+0x20))
+                    subadr = idata.addr & 0x7F
+                    appdata[subadr:subadr+idata.size] = idata.data
+                    address = idata.addr
+                    #print("Data record retrieved at address {0:04X}".format(address))
+                    chunks += 1
+                    if chunks == 4:
+                        flushchunk(appdata,header,basepage,address&0x7F80)
+                        chunks = 0
+                        appdata = bytearray(0x80)   #make a new one.
+                        gc.collect()    #Do GC things while the calc is processing
+                    
+            
+            self.sendpacket(PV.EOT)
+            if self.getpacket().cid != PV.ACK:
+                raise Exception("EOT packet not acknowledged.")
+            print("Transmission end. Time elapsed in ms: {0}".format(time.ticks_diff(time.ticks_ms(),starttime)))
+            pass
         elif header.isbackup():
             raise Exception("Sending backups not supported. WONTFIX.")
         else:
@@ -833,3 +901,5 @@ def log(v=None):
         return
 test = lambda : t.sendvar("linktest.8xp")
 pkdb(0)
+
+# t.sendvar("MINES4.8xk")
